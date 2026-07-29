@@ -29,7 +29,7 @@ dev = [
 ]
 
 [tool.fastapi]
-entrypoint = "inventory_reservation.presentation.http.main:app"
+entrypoint = "inventory_reservation.controller.main:app"
 
 [tool.pytest.ini_options]
 addopts = [

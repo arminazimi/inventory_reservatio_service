@@ -1,0 +1,2 @@
+"""Inventory Reservation bounded context."""
+

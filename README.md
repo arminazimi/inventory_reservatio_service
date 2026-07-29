@@ -29,3 +29,18 @@ For pip-based environments:
 python -m pip install -r requirements-dev.txt
 ```
 
+## Architecture
+
+The service uses a direct three-layer request flow:
+
+```text
+inventory_reservation/
+├── controller/  # FastAPI routes and transport contracts
+├── service/     # Business rules and workflow orchestration
+└── repository/  # PostgreSQL and external-provider access
+```
+
+Dependencies flow from `controller` to `service` to `repository`. See
+[`CONTEXT.md`](CONTEXT.md) for the ubiquitous language and test seams, and
+[`docs/adr/0001-three-layer-architecture.md`](docs/adr/0001-three-layer-architecture.md)
+for the architectural decision.
