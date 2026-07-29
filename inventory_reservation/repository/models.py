@@ -19,7 +19,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 NAMING_CONVENTION = {
     "ix": "ix_%(table_name)s_%(column_0_N_name)s",
@@ -306,6 +306,10 @@ class ReservationModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         default=1,
         server_default=text("1"),
     )
+    items: Mapped[list[ReservationItemModel]] = relationship(
+        back_populates="reservation",
+        cascade="all, delete-orphan",
+    )
 
 
 class ReservationItemModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -324,6 +328,7 @@ class ReservationItemModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     requested_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    reservation: Mapped[ReservationModel] = relationship(back_populates="items")
 
 
 class InventoryAllocationModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
