@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import select
@@ -211,6 +212,50 @@ class SqlAlchemyReservationRepository:
         if reservation_model.status is ReservationStatusModel.CONFIRMING:
             raise ReservationReconciliationRequiredError(reservation_id)
 
+        await self._release_reservation(
+            reservation_model,
+            terminal_status=ReservationStatusModel.CANCELLED,
+        )
+        await self._session.flush()
+        return await self._to_domain(reservation_model)
+
+    async def expire_batch(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> tuple[Reservation, ...]:
+        expired_statement = (
+            select(ReservationModel)
+            .where(
+                ReservationModel.status == ReservationStatusModel.PENDING,
+                ReservationModel.expires_at <= now,
+            )
+            .order_by(ReservationModel.expires_at, ReservationModel.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        reservations = (await self._session.scalars(expired_statement)).all()
+        for reservation in reservations:
+            await self._release_reservation(
+                reservation,
+                terminal_status=ReservationStatusModel.EXPIRED,
+            )
+
+        await self._session.flush()
+        expired: list[Reservation] = []
+        for reservation in reservations:
+            reservation_domain = await self._to_domain(reservation)
+            if reservation_domain is not None:
+                expired.append(reservation_domain)
+        return tuple(expired)
+
+    async def _release_reservation(
+        self,
+        reservation: ReservationModel,
+        *,
+        terminal_status: ReservationStatusModel,
+    ) -> None:
         allocations_statement = (
             select(
                 InventoryAllocationModel,
@@ -225,7 +270,7 @@ class SqlAlchemyReservationRepository:
                 InventoryProviderModel,
                 InventoryProviderModel.id == InventoryAllocationModel.provider_id,
             )
-            .where(ReservationItemModel.reservation_id == reservation_id)
+            .where(ReservationItemModel.reservation_id == reservation.id)
             .with_for_update()
         )
         allocations = (await self._session.execute(allocations_statement)).all()
@@ -237,7 +282,7 @@ class SqlAlchemyReservationRepository:
 
         for allocation, product_id, provider in allocations:
             outcome = await self._release_allocation(
-                reservation_id=reservation_id,
+                reservation_id=reservation.id,
                 allocation=allocation,
                 product_id=product_id,
                 provider=provider,
@@ -252,13 +297,9 @@ class SqlAlchemyReservationRepository:
                 allocation.status = AllocationStatus.HELD
                 release_pending = True
 
-        reservation_model.status = (
-            ReservationStatusModel.RELEASING
-            if release_pending
-            else ReservationStatusModel.CANCELLED
+        reservation.status = (
+            ReservationStatusModel.RELEASING if release_pending else terminal_status
         )
-        await self._session.flush()
-        return await self._to_domain(reservation_model)
 
     async def _release_allocation(
         self,

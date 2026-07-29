@@ -61,6 +61,7 @@ class ReservationStatus(StrEnum):
     CONFIRMED = "confirmed"
     RELEASING = "releasing"
     CANCELLED = "cancelled"
+    EXPIRED = "expired"
     FAILED = "failed"
 
 
@@ -159,6 +160,13 @@ class ReservationRepositoryPort(Protocol):
         reservation_id: UUID,
         user_id: UUID,
     ) -> Reservation | None: ...
+
+    async def expire_batch(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> tuple[Reservation, ...]: ...
 
     async def get(self, reservation_id: UUID) -> Reservation | None: ...
 
@@ -267,6 +275,26 @@ class ReservationService:
             return await repository.cancel(
                 reservation_id=reservation_id,
                 user_id=user_id,
+            )
+
+
+class ReservationExpirationWorker:
+    def __init__(
+        self,
+        *,
+        transaction_factory: ReservationTransactionFactory,
+        clock: Clock,
+        batch_size: int,
+    ) -> None:
+        self._transaction_factory = transaction_factory
+        self._clock = clock
+        self._batch_size = batch_size
+
+    async def run_once(self) -> tuple[Reservation, ...]:
+        async with self._transaction_factory() as repository:
+            return await repository.expire_batch(
+                now=self._clock.now(),
+                limit=self._batch_size,
             )
 
 

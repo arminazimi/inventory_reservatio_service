@@ -32,6 +32,7 @@ from inventory_reservation.repository.reservation import (
 from inventory_reservation.service.reservation import (
     InsufficientInventoryError,
     Reservation,
+    ReservationExpirationWorker,
     ReservationItem,
     ReservationNotCancellableError,
     ReservationNotConfirmableError,
@@ -46,6 +47,14 @@ FIXED_NOW = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 class FixedClock:
     def now(self) -> datetime:
         return FIXED_NOW
+
+
+class StaticClock:
+    def __init__(self, instant: datetime) -> None:
+        self._instant = instant
+
+    def now(self) -> datetime:
+        return self._instant
 
 
 class SynchronizingReservationRepository:
@@ -667,6 +676,126 @@ async def test_cancelled_reservation_releases_internal_hold_once() -> None:
             async with database.session() as session, session.begin():
                 await session.execute(
                     delete(ReservationModel).where(ReservationModel.id == reservation_id)
+                )
+                await session.execute(
+                    delete(InventoryLevelModel).where(
+                        InventoryLevelModel.product_id == product_id,
+                        InventoryLevelModel.provider_id == provider_id,
+                    )
+                )
+                await session.execute(
+                    delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
+                )
+                await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_expiration_worker_releases_only_expired_reservations() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    expired_reservation_id = uuid7()
+    future_reservation_id = uuid7()
+    user_id = uuid7()
+
+    try:
+        async with database.session() as session, session.begin():
+            unique_suffix = uuid7().hex
+            product = ProductModel(
+                sku=f"POSTGRES-EXPIRY-{unique_suffix}",
+                name="PostgreSQL expiration worker test product",
+            )
+            provider = InventoryProviderModel(
+                name=f"internal-reservation-expiry-{unique_suffix}",
+                kind=ProviderKind.INTERNAL,
+                driver="internal",
+                supports_hold=True,
+                supports_release=True,
+            )
+            session.add_all([product, provider])
+            await session.flush()
+            product_id = product.id
+            provider_id = provider.id
+            session.add(
+                InventoryLevelModel(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=5,
+                    reserved=0,
+                )
+            )
+
+        reservation_ids = iter((expired_reservation_id, future_reservation_id))
+        expired_service = ReservationService(
+            transaction_factory=lambda: reservation_transaction(database),
+            clock=StaticClock(FIXED_NOW),
+            reservation_id_factory=lambda: next(reservation_ids),
+            ttl=timedelta(minutes=15),
+        )
+        future_service = ReservationService(
+            transaction_factory=lambda: reservation_transaction(database),
+            clock=StaticClock(FIXED_NOW + timedelta(minutes=10)),
+            reservation_id_factory=lambda: next(reservation_ids),
+            ttl=timedelta(minutes=15),
+        )
+        worker = ReservationExpirationWorker(
+            transaction_factory=lambda: reservation_transaction(database),
+            clock=StaticClock(FIXED_NOW + timedelta(minutes=16)),
+            batch_size=10,
+        )
+
+        try:
+            await expired_service.create(
+                user_id=user_id,
+                items=(ReservationItem(product_id=product_id, quantity=2),),
+                idempotency_key="postgres-expired",
+            )
+            await future_service.create(
+                user_id=user_id,
+                items=(ReservationItem(product_id=product_id, quantity=1),),
+                idempotency_key="postgres-future",
+            )
+
+            async with database.session() as lock_session, lock_session.begin():
+                await lock_session.execute(
+                    select(ReservationModel)
+                    .where(ReservationModel.id == expired_reservation_id)
+                    .with_for_update()
+                )
+                skipped = await worker.run_once()
+
+            expired = await worker.run_once()
+            future = await future_service.get(future_reservation_id)
+
+            async with database.session() as session:
+                inventory = await InventoryRepository(session).get_snapshot(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                )
+
+            assert skipped == ()
+            assert [reservation.id for reservation in expired] == [expired_reservation_id]
+            assert expired[0].status is ReservationStatus.EXPIRED
+            assert future is not None
+            assert future.status is ReservationStatus.PENDING
+            assert inventory == InventorySnapshot(
+                product_id=product_id,
+                provider_id=provider_id,
+                on_hand=5,
+                reserved=1,
+                version=4,
+            )
+        finally:
+            async with database.session() as session, session.begin():
+                await session.execute(
+                    delete(ReservationModel).where(
+                        ReservationModel.id.in_((expired_reservation_id, future_reservation_id))
+                    )
                 )
                 await session.execute(
                     delete(InventoryLevelModel).where(
