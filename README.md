@@ -102,6 +102,8 @@ inventory_reservation/
 ```
 
 Dependencies flow from `controller` to `service` to `repository`. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the design reasoning and explicit
+trade-offs,
 [`CONTEXT.md`](CONTEXT.md) for the ubiquitous language and test seams, and
 [`docs/adr/0001-three-layer-architecture.md`](docs/adr/0001-three-layer-architecture.md)
 for the architectural decision.
