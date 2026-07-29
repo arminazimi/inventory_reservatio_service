@@ -1,7 +1,10 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid7
 
+import pytest
+
 from inventory_reservation.service.reservation import (
+    IdempotencyConflictError,
     Reservation,
     ReservationItem,
     ReservationService,
@@ -92,3 +95,25 @@ async def test_repeated_create_with_same_key_returns_original_reservation() -> N
     )
 
     assert (first.id, repeated.id) == (first_reservation_id, first_reservation_id)
+
+
+async def test_reused_idempotency_key_with_different_payload_is_rejected() -> None:
+    user_id = uuid7()
+    service = ReservationService(
+        repository=InMemoryReservationRepository(),
+        clock=FixedClock(),
+        reservation_id_factory=uuid7,
+        ttl=RESERVATION_TTL,
+    )
+    await service.create(
+        user_id=user_id,
+        items=(ReservationItem(product_id=PRODUCT_ID, quantity=2),),
+        idempotency_key="checkout-conflict",
+    )
+
+    with pytest.raises(IdempotencyConflictError):
+        await service.create(
+            user_id=user_id,
+            items=(ReservationItem(product_id=PRODUCT_ID, quantity=3),),
+            idempotency_key="checkout-conflict",
+        )

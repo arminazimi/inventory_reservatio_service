@@ -22,6 +22,16 @@ class EmptyReservationError(ValueError):
         super().__init__("Reservation must contain at least one item")
 
 
+class IdempotencyConflictError(ValueError):
+    def __init__(self, idempotency_key: str, reservation_id: UUID) -> None:
+        self.idempotency_key = idempotency_key
+        self.reservation_id = reservation_id
+        super().__init__(
+            f"Idempotency key {idempotency_key!r} is already used by reservation "
+            f"{reservation_id} for a different request"
+        )
+
+
 class ReservationStatus(StrEnum):
     PENDING = "pending"
 
@@ -126,6 +136,8 @@ class ReservationService:
             idempotency_key=idempotency_key,
         )
         if existing is not None:
+            if existing.request_fingerprint != request_fingerprint:
+                raise IdempotencyConflictError(idempotency_key, existing.id)
             return existing
 
         reservation = Reservation.start(
