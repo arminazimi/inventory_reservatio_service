@@ -25,6 +25,10 @@ class InMemoryReservationRepository:
         self._reservations_by_id[reservation.id] = reservation
         self._reservations_by_key[(reservation.user_id, reservation.idempotency_key)] = reservation
 
+    async def add_with_internal_hold(self, reservation: Reservation) -> bool:
+        await self.add(reservation)
+        return True
+
     async def get(self, reservation_id: UUID) -> Reservation | None:
         return self._reservations_by_id.get(reservation_id)
 

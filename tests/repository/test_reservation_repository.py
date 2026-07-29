@@ -9,7 +9,17 @@ import pytest
 from sqlalchemy import delete
 
 from inventory_reservation.repository.database import Database
-from inventory_reservation.repository.models import ProductModel, ReservationModel
+from inventory_reservation.repository.inventory import (
+    InventoryRepository,
+    InventorySnapshot,
+)
+from inventory_reservation.repository.models import (
+    InventoryLevelModel,
+    InventoryProviderModel,
+    ProductModel,
+    ProviderKind,
+    ReservationModel,
+)
 from inventory_reservation.repository.reservation import (
     SqlAlchemyReservationRepository,
     reservation_transaction,
@@ -38,8 +48,8 @@ class SynchronizingReservationRepository:
         self._repository = repository
         self._barrier = barrier
 
-    async def add(self, reservation: Reservation) -> None:
-        await self._repository.add(reservation)
+    async def add_with_internal_hold(self, reservation: Reservation) -> bool:
+        return await self._repository.add_with_internal_hold(reservation)
 
     async def get(self, reservation_id: UUID) -> Reservation | None:
         return await self._repository.get(reservation_id)
@@ -122,13 +132,29 @@ async def test_concurrent_retries_return_the_same_reservation() -> None:
 
     try:
         async with database.session() as session, session.begin():
+            unique_suffix = uuid7().hex
             product = ProductModel(
-                sku=f"POSTGRES-CONCURRENT-{uuid7().hex}",
+                sku=f"POSTGRES-CONCURRENT-{unique_suffix}",
                 name="PostgreSQL concurrent retry test product",
             )
-            session.add(product)
+            provider = InventoryProviderModel(
+                name=f"internal-reservation-concurrent-{unique_suffix}",
+                kind=ProviderKind.INTERNAL,
+                driver="internal",
+                supports_hold=True,
+            )
+            session.add_all([product, provider])
             await session.flush()
             product_id = product.id
+            provider_id = provider.id
+            session.add(
+                InventoryLevelModel(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=2,
+                    reserved=0,
+                )
+            )
 
         barrier = asyncio.Barrier(2)
         service = ReservationService(
@@ -156,7 +182,27 @@ async def test_concurrent_retries_return_the_same_reservation() -> None:
                 ),
             )
 
-            assert reservations[0].id == reservations[1].id
+            async with database.session() as session:
+                inventory = await InventoryRepository(session).get_snapshot(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                )
+
+            assert (
+                reservations[0].id,
+                reservations[1].id,
+                inventory,
+            ) == (
+                reservations[0].id,
+                reservations[0].id,
+                InventorySnapshot(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=2,
+                    reserved=2,
+                    version=2,
+                ),
+            )
         finally:
             async with database.session() as session, session.begin():
                 await session.execute(
@@ -164,6 +210,15 @@ async def test_concurrent_retries_return_the_same_reservation() -> None:
                         ReservationModel.user_id == user_id,
                         ReservationModel.idempotency_key == idempotency_key,
                     )
+                )
+                await session.execute(
+                    delete(InventoryLevelModel).where(
+                        InventoryLevelModel.product_id == product_id,
+                        InventoryLevelModel.provider_id == provider_id,
+                    )
+                )
+                await session.execute(
+                    delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
                 )
                 await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
     finally:
@@ -181,13 +236,29 @@ async def test_service_transaction_commits_idempotent_reservation() -> None:
 
     try:
         async with database.session() as session, session.begin():
+            unique_suffix = uuid7().hex
             product = ProductModel(
-                sku=f"POSTGRES-TRANSACTION-{uuid7().hex}",
+                sku=f"POSTGRES-TRANSACTION-{unique_suffix}",
                 name="PostgreSQL transaction test product",
             )
-            session.add(product)
+            provider = InventoryProviderModel(
+                name=f"internal-reservation-transaction-{unique_suffix}",
+                kind=ProviderKind.INTERNAL,
+                driver="internal",
+                supports_hold=True,
+            )
+            session.add_all([product, provider])
             await session.flush()
             product_id = product.id
+            provider_id = provider.id
+            session.add(
+                InventoryLevelModel(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=2,
+                    reserved=0,
+                )
+            )
 
         first_reservation_id = uuid7()
         next_reservation_id = uuid7()
@@ -223,6 +294,15 @@ async def test_service_transaction_commits_idempotent_reservation() -> None:
             async with database.session() as session, session.begin():
                 await session.execute(
                     delete(ReservationModel).where(ReservationModel.id == first_reservation_id)
+                )
+                await session.execute(
+                    delete(InventoryLevelModel).where(
+                        InventoryLevelModel.product_id == product_id,
+                        InventoryLevelModel.provider_id == provider_id,
+                    )
+                )
+                await session.execute(
+                    delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
                 )
                 await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
     finally:

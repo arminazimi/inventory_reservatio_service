@@ -51,6 +51,12 @@ class ReservationItem:
             raise InvalidReservationQuantityError(self.quantity)
 
 
+class InsufficientInventoryError(RuntimeError):
+    def __init__(self, items: tuple[ReservationItem, ...]) -> None:
+        self.items = items
+        super().__init__("Insufficient internal inventory for reservation")
+
+
 @dataclass(frozen=True, slots=True)
 class ReservationDraft:
     reservation_id: UUID
@@ -102,7 +108,7 @@ class Clock(Protocol):
 
 
 class ReservationRepositoryPort(Protocol):
-    async def add(self, reservation: Reservation) -> None: ...
+    async def add_with_internal_hold(self, reservation: Reservation) -> bool: ...
 
     async def get(self, reservation_id: UUID) -> Reservation | None: ...
 
@@ -167,7 +173,9 @@ class ReservationService:
                         ttl=self._ttl,
                     )
                 )
-                await repository.add(reservation)
+                inventory_held = await repository.add_with_internal_hold(reservation)
+                if not inventory_held:
+                    raise InsufficientInventoryError(items)
                 return reservation
         except ConcurrentReservationCreationError:
             async with self._transaction_factory() as repository:

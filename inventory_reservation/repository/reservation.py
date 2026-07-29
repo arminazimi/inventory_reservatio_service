@@ -7,7 +7,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from inventory_reservation.repository.database import Database
+from inventory_reservation.repository.inventory import InventoryRepository
 from inventory_reservation.repository.models import (
+    AllocationStatus,
+    InventoryAllocationModel,
     ReservationItemModel,
     ReservationModel,
 )
@@ -24,6 +27,10 @@ from inventory_reservation.service.reservation import (
 IDEMPOTENCY_CONSTRAINT = "uq_reservations_user_id_idempotency_key"
 
 
+class _InsufficientInternalInventoryError(RuntimeError):
+    pass
+
+
 class SqlAlchemyReservationRepository:
     """Map reservation aggregates to PostgreSQL without owning the transaction."""
 
@@ -31,6 +38,42 @@ class SqlAlchemyReservationRepository:
         self._session = session
 
     async def add(self, reservation: Reservation) -> None:
+        self._session.add(self._to_model(reservation))
+
+    async def add_with_internal_hold(self, reservation: Reservation) -> bool:
+        try:
+            async with self._session.begin_nested():
+                reservation_model = self._to_model(reservation)
+                self._session.add(reservation_model)
+                await self._session.flush()
+
+                inventory_repository = InventoryRepository(self._session)
+                for item_model in reservation_model.items:
+                    snapshot = await inventory_repository.try_hold_internal(
+                        product_id=item_model.product_id,
+                        quantity=item_model.requested_quantity,
+                    )
+                    if snapshot is None:
+                        raise _InsufficientInternalInventoryError
+
+                    self._session.add(
+                        InventoryAllocationModel(
+                            reservation_item_id=item_model.id,
+                            provider_id=snapshot.provider_id,
+                            quantity=item_model.requested_quantity,
+                            status=AllocationStatus.HELD,
+                            hold_idempotency_key=(
+                                f"reservation:{reservation.id}:product:{item_model.product_id}:hold"
+                            ),
+                        )
+                    )
+        except _InsufficientInternalInventoryError:
+            return False
+
+        return True
+
+    @staticmethod
+    def _to_model(reservation: Reservation) -> ReservationModel:
         reservation_model = ReservationModel(
             id=reservation.id,
             user_id=reservation.user_id,
@@ -48,7 +91,7 @@ class SqlAlchemyReservationRepository:
             )
             for item in reservation.items
         ]
-        self._session.add(reservation_model)
+        return reservation_model
 
     async def get(self, reservation_id: UUID) -> Reservation | None:
         reservation_statement = select(ReservationModel).where(
