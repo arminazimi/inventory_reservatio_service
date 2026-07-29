@@ -8,6 +8,7 @@ from starlette.responses import JSONResponse
 
 from inventory_reservation.service.reservation import (
     IdempotencyConflictError,
+    InsufficientInventoryError,
     Reservation,
     ReservationItem,
     ReservationService,
@@ -62,7 +63,7 @@ class ReservationResponse(BaseModel):
 class ErrorDetail(BaseModel):
     code: str
     message: str
-    reservation_id: UUID
+    reservation_id: UUID | None = None
 
 
 class ErrorResponse(BaseModel):
@@ -91,7 +92,26 @@ async def handle_idempotency_conflict(
     )
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
-        content=response.model_dump(mode="json"),
+        content=response.model_dump(mode="json", exclude_none=True),
+    )
+
+
+async def handle_insufficient_inventory(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, InsufficientInventoryError):
+        raise error
+
+    response = ErrorResponse(
+        error=ErrorDetail(
+            code="insufficient_inventory",
+            message="Requested inventory is not available.",
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json", exclude_none=True),
     )
 
 
@@ -111,7 +131,7 @@ async def handle_reservation_not_found(
     )
     return JSONResponse(
         status_code=status.HTTP_404_NOT_FOUND,
-        content=response.model_dump(mode="json"),
+        content=response.model_dump(mode="json", exclude_none=True),
     )
 
 
@@ -124,7 +144,10 @@ def create_reservation_router(reservation_service: ReservationService) -> APIRou
         responses={
             status.HTTP_409_CONFLICT: {
                 "model": ErrorResponse,
-                "description": "Idempotency key was reused for a different request.",
+                "description": (
+                    "Idempotency key was reused for a different request, "
+                    "or requested inventory is unavailable."
+                ),
             }
         },
     )

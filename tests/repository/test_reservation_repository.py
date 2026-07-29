@@ -25,6 +25,7 @@ from inventory_reservation.repository.reservation import (
     reservation_transaction,
 )
 from inventory_reservation.service.reservation import (
+    InsufficientInventoryError,
     Reservation,
     ReservationItem,
     ReservationRepositoryPort,
@@ -305,5 +306,118 @@ async def test_service_transaction_commits_idempotent_reservation() -> None:
                     delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
                 )
                 await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_insufficient_inventory_rolls_back_reservation_and_previous_holds() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    reservation_id = uuid7()
+
+    try:
+        async with database.session() as session, session.begin():
+            unique_suffix = uuid7().hex
+            available_product = ProductModel(
+                sku=f"POSTGRES-ROLLBACK-AVAILABLE-{unique_suffix}",
+                name="Available rollback test product",
+            )
+            unavailable_product = ProductModel(
+                sku=f"POSTGRES-ROLLBACK-UNAVAILABLE-{unique_suffix}",
+                name="Unavailable rollback test product",
+            )
+            provider = InventoryProviderModel(
+                name=f"internal-reservation-rollback-{unique_suffix}",
+                kind=ProviderKind.INTERNAL,
+                driver="internal",
+                supports_hold=True,
+            )
+            session.add_all([available_product, unavailable_product, provider])
+            await session.flush()
+            available_product_id = available_product.id
+            unavailable_product_id = unavailable_product.id
+            provider_id = provider.id
+            session.add_all(
+                [
+                    InventoryLevelModel(
+                        product_id=available_product_id,
+                        provider_id=provider_id,
+                        on_hand=2,
+                        reserved=0,
+                    ),
+                    InventoryLevelModel(
+                        product_id=unavailable_product_id,
+                        provider_id=provider_id,
+                        on_hand=0,
+                        reserved=0,
+                    ),
+                ]
+            )
+
+        service = ReservationService(
+            transaction_factory=lambda: reservation_transaction(database),
+            clock=FixedClock(),
+            reservation_id_factory=lambda: reservation_id,
+            ttl=timedelta(minutes=15),
+        )
+
+        try:
+            with pytest.raises(InsufficientInventoryError):
+                await service.create(
+                    user_id=uuid7(),
+                    items=(
+                        ReservationItem(
+                            product_id=available_product_id,
+                            quantity=2,
+                        ),
+                        ReservationItem(
+                            product_id=unavailable_product_id,
+                            quantity=1,
+                        ),
+                    ),
+                    idempotency_key="postgres-insufficient-inventory",
+                )
+
+            persisted = await service.get(reservation_id)
+            async with database.session() as session:
+                inventory = await InventoryRepository(session).get_snapshot(
+                    product_id=available_product_id,
+                    provider_id=provider_id,
+                )
+
+            assert persisted is None
+            assert inventory == InventorySnapshot(
+                product_id=available_product_id,
+                provider_id=provider_id,
+                on_hand=2,
+                reserved=0,
+                version=1,
+            )
+        finally:
+            async with database.session() as session, session.begin():
+                await session.execute(
+                    delete(ReservationModel).where(ReservationModel.id == reservation_id)
+                )
+                await session.execute(
+                    delete(InventoryLevelModel).where(
+                        InventoryLevelModel.product_id.in_(
+                            (available_product_id, unavailable_product_id)
+                        ),
+                        InventoryLevelModel.provider_id == provider_id,
+                    )
+                )
+                await session.execute(
+                    delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
+                )
+                await session.execute(
+                    delete(ProductModel).where(
+                        ProductModel.id.in_((available_product_id, unavailable_product_id))
+                    )
+                )
     finally:
         await database.close()

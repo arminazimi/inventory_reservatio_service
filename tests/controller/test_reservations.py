@@ -17,7 +17,8 @@ RESERVATION_TTL = timedelta(minutes=15)
 
 
 class InMemoryReservationRepository:
-    def __init__(self) -> None:
+    def __init__(self, *, inventory_available: bool = True) -> None:
+        self._inventory_available = inventory_available
         self._reservations_by_id: dict[UUID, Reservation] = {}
         self._reservations_by_key: dict[tuple[UUID, str], Reservation] = {}
 
@@ -26,6 +27,8 @@ class InMemoryReservationRepository:
         self._reservations_by_key[(reservation.user_id, reservation.idempotency_key)] = reservation
 
     async def add_with_internal_hold(self, reservation: Reservation) -> bool:
+        if not self._inventory_available:
+            return False
         await self.add(reservation)
         return True
 
@@ -99,6 +102,47 @@ async def test_user_can_create_reservation() -> None:
         ],
         "created_at": "2026-07-29T12:00:00Z",
         "expires_at": "2026-07-29T12:15:00Z",
+    }
+
+
+async def test_create_reservation_returns_conflict_when_inventory_is_insufficient() -> None:
+    user_id = uuid7()
+    product_id = uuid7()
+    repository = InMemoryReservationRepository(inventory_available=False)
+    reservation_service = ReservationService(
+        transaction_factory=lambda: in_memory_transaction(repository),
+        clock=FixedClock(),
+        reservation_id_factory=uuid7,
+        ttl=RESERVATION_TTL,
+    )
+    app = create_app(reservation_service=reservation_service)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/v1/reservations",
+            headers={
+                "X-User-ID": str(user_id),
+                "Idempotency-Key": "checkout-insufficient-inventory",
+            },
+            json={
+                "items": [
+                    {
+                        "product_id": str(product_id),
+                        "quantity": 2,
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "insufficient_inventory",
+            "message": "Requested inventory is not available.",
+        }
     }
 
 

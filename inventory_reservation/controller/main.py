@@ -11,12 +11,14 @@ from inventory_reservation.controller.reservation import (
     ReservationNotFoundError,
     create_reservation_router,
     handle_idempotency_conflict,
+    handle_insufficient_inventory,
     handle_reservation_not_found,
 )
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.reservation import (
     IdempotencyConflictError,
+    InsufficientInventoryError,
     ReservationService,
 )
 
@@ -43,6 +45,10 @@ def create_app(
     app.add_exception_handler(
         IdempotencyConflictError,
         handle_idempotency_conflict,
+    )
+    app.add_exception_handler(
+        InsufficientInventoryError,
+        handle_insufficient_inventory,
     )
     app.add_exception_handler(
         ReservationNotFoundError,
