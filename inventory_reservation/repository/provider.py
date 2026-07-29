@@ -12,6 +12,8 @@ from inventory_reservation.service.provider import (
     ProviderCallFailedError,
     ProviderConfirmAttempt,
     ProviderHoldAttempt,
+    ProviderReleaseAttempt,
+    ReleaseCommand,
 )
 
 
@@ -80,6 +82,24 @@ class HttpInventoryProvider:
 
         response.raise_for_status()
         return ProviderConfirmAttempt.confirmed()
+
+    async def release(self, command: ReleaseCommand) -> ProviderReleaseAttempt:
+        try:
+            response = await self._client.post(
+                f"{self._hold_url}/{command.hold_reference}/release",
+                headers={"Idempotency-Key": command.idempotency_key},
+                timeout=self._timeout,
+            )
+        except httpx.TimeoutException:
+            return ProviderReleaseAttempt.unknown()
+
+        if response.status_code == httpx.codes.NOT_FOUND:
+            return ProviderReleaseAttempt.released()
+        if response.is_server_error:
+            raise ProviderCallFailedError(self.provider_id)
+
+        response.raise_for_status()
+        return ProviderReleaseAttempt.released()
 
 
 @dataclass(frozen=True, slots=True)

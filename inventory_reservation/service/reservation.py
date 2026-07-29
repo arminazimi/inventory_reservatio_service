@@ -49,10 +49,17 @@ class ReservationNotConfirmableError(RuntimeError):
         super().__init__(f"Cancelled reservation {reservation_id} cannot be confirmed")
 
 
+class ReservationReconciliationRequiredError(RuntimeError):
+    def __init__(self, reservation_id: UUID) -> None:
+        self.reservation_id = reservation_id
+        super().__init__(f"Reservation {reservation_id} has an unknown provider outcome")
+
+
 class ReservationStatus(StrEnum):
     PENDING = "pending"
     CONFIRMING = "confirming"
     CONFIRMED = "confirmed"
+    RELEASING = "releasing"
     CANCELLED = "cancelled"
     FAILED = "failed"
 
@@ -127,6 +134,8 @@ class Reservation:
             return self
         if self.status is ReservationStatus.CONFIRMED:
             raise ReservationNotCancellableError(self.id)
+        if self.status is ReservationStatus.CONFIRMING:
+            raise ReservationReconciliationRequiredError(self.id)
         return replace(self, status=ReservationStatus.CANCELLED)
 
 

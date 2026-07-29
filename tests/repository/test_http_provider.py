@@ -11,6 +11,8 @@ from inventory_reservation.service.provider import (
     ProviderCallFailedError,
     ProviderConfirmAttempt,
     ProviderHoldAttempt,
+    ProviderReleaseAttempt,
+    ReleaseCommand,
 )
 
 PROVIDER_ID = UUID("00000000-0000-7000-8000-000000000001")
@@ -164,3 +166,36 @@ async def test_successful_confirmation_uses_hold_reference_and_idempotency_key()
         )
 
     assert attempt == ProviderConfirmAttempt.confirmed()
+
+
+async def test_successful_release_uses_hold_reference_and_idempotency_key() -> None:
+    async def provider_api(request: httpx.Request) -> httpx.Response:
+        assert (
+            request.method,
+            request.url.path,
+            request.headers["Idempotency-Key"],
+            request.content,
+        ) == (
+            "POST",
+            "/holds/external-hold-123/release",
+            "reservation:123:allocation:456:release",
+            b"",
+        )
+        return httpx.Response(status_code=204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider_api)) as client:
+        provider = HttpInventoryProvider(
+            provider_id=PROVIDER_ID,
+            base_url="https://inventory-provider.example",
+            timeout=2.0,
+            client=client,
+        )
+
+        attempt = await provider.release(
+            ReleaseCommand(
+                hold_reference="external-hold-123",
+                idempotency_key="reservation:123:allocation:456:release",
+            )
+        )
+
+    assert attempt == ProviderReleaseAttempt.released()

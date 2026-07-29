@@ -29,6 +29,7 @@ from inventory_reservation.repository.provider import ProviderRegistry
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.reservation import (
     ReservationItem,
+    ReservationReconciliationRequiredError,
     ReservationService,
     ReservationStatus,
 )
@@ -416,6 +417,11 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                     reservation_id=reservation_id,
                     user_id=user_id,
                 )
+                with pytest.raises(ReservationReconciliationRequiredError):
+                    await service.cancel(
+                        reservation_id=reservation_id,
+                        user_id=user_id,
+                    )
 
                 async with database.session() as session:
                     allocation = (
@@ -459,6 +465,301 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                     ProviderOperationStatus.UNKNOWN,
                     1,
                     "unknown-confirm-hold",
+                )
+            finally:
+                async with database.session() as session, session.begin():
+                    await session.execute(
+                        delete(ReservationModel).where(ReservationModel.id == reservation_id)
+                    )
+                    await session.execute(
+                        delete(InventoryLevelModel).where(
+                            InventoryLevelModel.product_id == product_id
+                        )
+                    )
+                    await session.execute(
+                        delete(InventoryProviderModel).where(
+                            InventoryProviderModel.id == provider_id
+                        )
+                    )
+                    await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_external_hold_is_released_once_and_operation_is_recorded() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    reservation_id = uuid7()
+    user_id = uuid7()
+    requests: list[tuple[str, str, str]] = []
+
+    async def external_provider_api(request: httpx.Request) -> httpx.Response:
+        requests.append(
+            (
+                request.method,
+                request.url.path,
+                request.headers["Idempotency-Key"],
+            )
+        )
+        if request.url.path == "/holds":
+            return httpx.Response(
+                status_code=201,
+                json={"hold_reference": "external-release-hold"},
+            )
+        return httpx.Response(status_code=204)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(external_provider_api)
+        ) as client:
+            provider_registry = ProviderRegistry(client=client)
+
+            async with database.session() as session, session.begin():
+                unique_suffix = uuid7().hex
+                product = ProductModel(
+                    sku=f"EXTERNAL-RELEASE-{unique_suffix}",
+                    name="External release test product",
+                )
+                provider = InventoryProviderModel(
+                    name=f"external-release-{unique_suffix}",
+                    kind=ProviderKind.EXTERNAL,
+                    driver="http",
+                    base_url="https://inventory-provider.example",
+                    request_timeout_ms=2000,
+                    supports_hold=True,
+                    supports_release=True,
+                )
+                session.add_all([product, provider])
+                await session.flush()
+                product_id = product.id
+                provider_id = provider.id
+                session.add(
+                    InventoryLevelModel(
+                        product_id=product_id,
+                        provider_id=provider_id,
+                        on_hand=0,
+                        reserved=0,
+                    )
+                )
+
+            service = ReservationService(
+                transaction_factory=lambda: reservation_transaction(
+                    database,
+                    provider_registry,
+                ),
+                clock=FixedClock(),
+                reservation_id_factory=lambda: reservation_id,
+                ttl=timedelta(minutes=15),
+            )
+
+            try:
+                await service.create(
+                    user_id=user_id,
+                    items=(ReservationItem(product_id=product_id, quantity=2),),
+                    idempotency_key="external-provider-release",
+                )
+                first_cancellation = await service.cancel(
+                    reservation_id=reservation_id,
+                    user_id=user_id,
+                )
+                repeated_cancellation = await service.cancel(
+                    reservation_id=reservation_id,
+                    user_id=user_id,
+                )
+
+                async with database.session() as session:
+                    allocation = (
+                        await session.scalars(
+                            select(InventoryAllocationModel)
+                            .join(
+                                ReservationItemModel,
+                                ReservationItemModel.id
+                                == InventoryAllocationModel.reservation_item_id,
+                            )
+                            .where(ReservationItemModel.reservation_id == reservation_id)
+                        )
+                    ).one()
+                    operation = (
+                        await session.scalars(
+                            select(ProviderOperationModel).where(
+                                ProviderOperationModel.allocation_id == allocation.id,
+                                ProviderOperationModel.operation == ProviderOperationType.RELEASE,
+                            )
+                        )
+                    ).one()
+
+                assert first_cancellation is not None
+                assert repeated_cancellation == first_cancellation
+                assert first_cancellation.status is ReservationStatus.CANCELLED
+                assert requests == [
+                    (
+                        "POST",
+                        "/holds",
+                        f"reservation:{reservation_id}:product:{product_id}:hold",
+                    ),
+                    (
+                        "POST",
+                        "/holds/external-release-hold/release",
+                        f"reservation:{reservation_id}:allocation:{allocation.id}:release",
+                    ),
+                ]
+                assert allocation.status is AllocationStatus.RELEASED
+                assert (
+                    operation.status,
+                    operation.idempotency_key,
+                    operation.attempt_count,
+                    operation.external_reference,
+                ) == (
+                    ProviderOperationStatus.SUCCEEDED,
+                    f"reservation:{reservation_id}:allocation:{allocation.id}:release",
+                    1,
+                    "external-release-hold",
+                )
+            finally:
+                async with database.session() as session, session.begin():
+                    await session.execute(
+                        delete(ReservationModel).where(ReservationModel.id == reservation_id)
+                    )
+                    await session.execute(
+                        delete(InventoryLevelModel).where(
+                            InventoryLevelModel.product_id == product_id
+                        )
+                    )
+                    await session.execute(
+                        delete(InventoryProviderModel).where(
+                            InventoryProviderModel.id == provider_id
+                        )
+                    )
+                    await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_unknown_external_release_is_persisted_without_blind_retry() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    reservation_id = uuid7()
+    user_id = uuid7()
+    requests: list[str] = []
+
+    async def external_provider_api(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/holds":
+            return httpx.Response(
+                status_code=201,
+                json={"hold_reference": "unknown-release-hold"},
+            )
+        raise httpx.ReadTimeout(
+            "Provider release timed out",
+            request=request,
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(external_provider_api)
+        ) as client:
+            provider_registry = ProviderRegistry(client=client)
+
+            async with database.session() as session, session.begin():
+                unique_suffix = uuid7().hex
+                product = ProductModel(
+                    sku=f"EXTERNAL-RELEASE-UNKNOWN-{unique_suffix}",
+                    name="Unknown external release test product",
+                )
+                provider = InventoryProviderModel(
+                    name=f"external-release-unknown-{unique_suffix}",
+                    kind=ProviderKind.EXTERNAL,
+                    driver="http",
+                    base_url="https://inventory-provider.example",
+                    request_timeout_ms=2000,
+                    supports_hold=True,
+                    supports_release=True,
+                )
+                session.add_all([product, provider])
+                await session.flush()
+                product_id = product.id
+                provider_id = provider.id
+                session.add(
+                    InventoryLevelModel(
+                        product_id=product_id,
+                        provider_id=provider_id,
+                        on_hand=0,
+                        reserved=0,
+                    )
+                )
+
+            service = ReservationService(
+                transaction_factory=lambda: reservation_transaction(
+                    database,
+                    provider_registry,
+                ),
+                clock=FixedClock(),
+                reservation_id_factory=lambda: reservation_id,
+                ttl=timedelta(minutes=15),
+            )
+
+            try:
+                await service.create(
+                    user_id=user_id,
+                    items=(ReservationItem(product_id=product_id, quantity=1),),
+                    idempotency_key="unknown-external-release",
+                )
+                first_cancellation = await service.cancel(
+                    reservation_id=reservation_id,
+                    user_id=user_id,
+                )
+                repeated_cancellation = await service.cancel(
+                    reservation_id=reservation_id,
+                    user_id=user_id,
+                )
+
+                async with database.session() as session:
+                    allocation = (
+                        await session.scalars(
+                            select(InventoryAllocationModel)
+                            .join(
+                                ReservationItemModel,
+                                ReservationItemModel.id
+                                == InventoryAllocationModel.reservation_item_id,
+                            )
+                            .where(ReservationItemModel.reservation_id == reservation_id)
+                        )
+                    ).one()
+                    operation = (
+                        await session.scalars(
+                            select(ProviderOperationModel).where(
+                                ProviderOperationModel.allocation_id == allocation.id,
+                                ProviderOperationModel.operation == ProviderOperationType.RELEASE,
+                            )
+                        )
+                    ).one()
+
+                assert first_cancellation is not None
+                assert repeated_cancellation == first_cancellation
+                assert first_cancellation.status is ReservationStatus.RELEASING
+                assert requests == [
+                    "/holds",
+                    "/holds/unknown-release-hold/release",
+                ]
+                assert allocation.status is AllocationStatus.UNKNOWN
+                assert (
+                    operation.status,
+                    operation.attempt_count,
+                    operation.external_reference,
+                ) == (
+                    ProviderOperationStatus.UNKNOWN,
+                    1,
+                    "unknown-release-hold",
                 )
             finally:
                 async with database.session() as session, session.begin():

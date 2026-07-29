@@ -1,8 +1,8 @@
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, TypeVar
 from uuid import UUID
 
 
@@ -20,6 +20,12 @@ class ProviderConfirmOutcome(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ProviderReleaseOutcome(StrEnum):
+    RELEASED = "released"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class HoldCommand:
     product_id: UUID
@@ -29,6 +35,12 @@ class HoldCommand:
 
 @dataclass(frozen=True, slots=True)
 class ConfirmCommand:
+    hold_reference: str
+    idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseCommand:
     hold_reference: str
     idempotency_key: str
 
@@ -80,6 +92,23 @@ class ProviderConfirmAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderReleaseAttempt:
+    outcome: ProviderReleaseOutcome
+
+    @classmethod
+    def released(cls) -> ProviderReleaseAttempt:
+        return cls(outcome=ProviderReleaseOutcome.RELEASED)
+
+    @classmethod
+    def temporarily_unavailable(cls) -> ProviderReleaseAttempt:
+        return cls(outcome=ProviderReleaseOutcome.TEMPORARILY_UNAVAILABLE)
+
+    @classmethod
+    def unknown(cls) -> ProviderReleaseAttempt:
+        return cls(outcome=ProviderReleaseOutcome.UNKNOWN)
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderHold:
     provider_id: UUID
     reference: str | None = None
@@ -99,7 +128,14 @@ class ConfirmProvider(Protocol):
     async def confirm(self, command: ConfirmCommand) -> ProviderConfirmAttempt: ...
 
 
-class InventoryProvider(HoldProvider, ConfirmProvider, Protocol):
+class ReleaseProvider(Protocol):
+    @property
+    def provider_id(self) -> UUID: ...
+
+    async def release(self, command: ReleaseCommand) -> ProviderReleaseAttempt: ...
+
+
+class InventoryProvider(HoldProvider, ConfirmProvider, ReleaseProvider, Protocol):
     pass
 
 
@@ -107,6 +143,14 @@ class ProviderCallFailedError(RuntimeError):
     def __init__(self, provider_id: UUID) -> None:
         self.provider_id = provider_id
         super().__init__(f"Provider {provider_id} call failed")
+
+
+ProviderAttemptT = TypeVar(
+    "ProviderAttemptT",
+    ProviderHoldAttempt,
+    ProviderConfirmAttempt,
+    ProviderReleaseAttempt,
+)
 
 
 class CircuitBreakerProvider:
@@ -128,57 +172,52 @@ class CircuitBreakerProvider:
         self._probe_in_flight = False
 
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
-        is_probe = False
-        if self._opened_at is not None:
-            if self._monotonic() - self._opened_at < self._recovery_timeout:
-                return ProviderHoldAttempt.temporarily_unavailable()
-            if self._probe_in_flight:
-                return ProviderHoldAttempt.temporarily_unavailable()
-            self._probe_in_flight = True
-            is_probe = True
-
-        try:
-            try:
-                attempt = await self._provider.hold(command)
-            except ProviderCallFailedError:
-                self._failure_count += 1
-                if self._failure_count >= self._failure_threshold:
-                    self._opened_at = self._monotonic()
-                return ProviderHoldAttempt.temporarily_unavailable()
-
-            if attempt.outcome is ProviderHoldOutcome.UNKNOWN:
-                self._failure_count += 1
-                if self._failure_count >= self._failure_threshold:
-                    self._opened_at = self._monotonic()
-                return attempt
-
-            self._failure_count = 0
-            self._opened_at = None
-            return attempt
-        finally:
-            if is_probe:
-                self._probe_in_flight = False
+        return await self._execute(
+            operation=lambda: self._provider.hold(command),
+            temporarily_unavailable=ProviderHoldAttempt.temporarily_unavailable,
+            is_unknown=lambda attempt: attempt.outcome is ProviderHoldOutcome.UNKNOWN,
+        )
 
     async def confirm(self, command: ConfirmCommand) -> ProviderConfirmAttempt:
+        return await self._execute(
+            operation=lambda: self._provider.confirm(command),
+            temporarily_unavailable=ProviderConfirmAttempt.temporarily_unavailable,
+            is_unknown=lambda attempt: attempt.outcome is ProviderConfirmOutcome.UNKNOWN,
+        )
+
+    async def release(self, command: ReleaseCommand) -> ProviderReleaseAttempt:
+        return await self._execute(
+            operation=lambda: self._provider.release(command),
+            temporarily_unavailable=ProviderReleaseAttempt.temporarily_unavailable,
+            is_unknown=lambda attempt: attempt.outcome is ProviderReleaseOutcome.UNKNOWN,
+        )
+
+    async def _execute(
+        self,
+        *,
+        operation: Callable[[], Awaitable[ProviderAttemptT]],
+        temporarily_unavailable: Callable[[], ProviderAttemptT],
+        is_unknown: Callable[[ProviderAttemptT], bool],
+    ) -> ProviderAttemptT:
         is_probe = False
         if self._opened_at is not None:
             if self._monotonic() - self._opened_at < self._recovery_timeout:
-                return ProviderConfirmAttempt.temporarily_unavailable()
+                return temporarily_unavailable()
             if self._probe_in_flight:
-                return ProviderConfirmAttempt.temporarily_unavailable()
+                return temporarily_unavailable()
             self._probe_in_flight = True
             is_probe = True
 
         try:
             try:
-                attempt = await self._provider.confirm(command)
+                attempt = await operation()
             except ProviderCallFailedError:
                 self._failure_count += 1
                 if self._failure_count >= self._failure_threshold:
                     self._opened_at = self._monotonic()
-                return ProviderConfirmAttempt.temporarily_unavailable()
+                return temporarily_unavailable()
 
-            if attempt.outcome is ProviderConfirmOutcome.UNKNOWN:
+            if is_unknown(attempt):
                 self._failure_count += 1
                 if self._failure_count >= self._failure_threshold:
                     self._opened_at = self._monotonic()

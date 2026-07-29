@@ -13,6 +13,7 @@ from inventory_reservation.service.reservation import (
     ReservationItem,
     ReservationNotCancellableError,
     ReservationNotConfirmableError,
+    ReservationReconciliationRequiredError,
     ReservationService,
     ReservationStatus,
 )
@@ -177,6 +178,26 @@ async def handle_reservation_not_confirmable(
     )
 
 
+async def handle_reconciliation_required(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, ReservationReconciliationRequiredError):
+        raise error
+
+    response = ErrorResponse(
+        error=ErrorDetail(
+            code="reservation_reconciliation_required",
+            message=("Reservation has an unknown provider outcome and requires reconciliation."),
+            reservation_id=error.reservation_id,
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json", exclude_none=True),
+    )
+
+
 def create_reservation_router(reservation_service: ReservationService) -> APIRouter:
     router = APIRouter(prefix="/v1/reservations", tags=["reservations"])
 
@@ -266,7 +287,10 @@ def create_reservation_router(reservation_service: ReservationService) -> APIRou
             },
             status.HTTP_409_CONFLICT: {
                 "model": ErrorResponse,
-                "description": "Confirmed reservation cannot be cancelled.",
+                "description": (
+                    "Reservation is already confirmed or has an unknown "
+                    "provider outcome requiring reconciliation."
+                ),
             },
         },
     )

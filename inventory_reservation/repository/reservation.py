@@ -28,6 +28,8 @@ from inventory_reservation.repository.provider import ProviderRegistry
 from inventory_reservation.service.provider import (
     ConfirmCommand,
     ProviderConfirmOutcome,
+    ProviderReleaseOutcome,
+    ReleaseCommand,
 )
 from inventory_reservation.service.reservation import (
     ConcurrentReservationCreationError,
@@ -35,6 +37,7 @@ from inventory_reservation.service.reservation import (
     ReservationItem,
     ReservationNotCancellableError,
     ReservationNotConfirmableError,
+    ReservationReconciliationRequiredError,
     ReservationRepositoryPort,
     ReservationStatus,
 )
@@ -205,12 +208,14 @@ class SqlAlchemyReservationRepository:
             return await self._to_domain(reservation_model)
         if reservation_model.status is ReservationStatusModel.CONFIRMED:
             raise ReservationNotCancellableError(reservation_id)
+        if reservation_model.status is ReservationStatusModel.CONFIRMING:
+            raise ReservationReconciliationRequiredError(reservation_id)
 
         allocations_statement = (
             select(
                 InventoryAllocationModel,
                 ReservationItemModel.product_id,
-                InventoryProviderModel.kind,
+                InventoryProviderModel,
             )
             .join(
                 ReservationItemModel,
@@ -228,24 +233,126 @@ class SqlAlchemyReservationRepository:
             self._session,
             self._provider_registry,
         )
+        release_pending = False
 
-        for allocation, product_id, provider_kind in allocations:
-            if allocation.status is AllocationStatus.RELEASED:
-                continue
-            if provider_kind is not ProviderKind.INTERNAL:
-                raise _InventoryReleaseError
-            released_inventory = await inventory_repository.release_hold(
+        for allocation, product_id, provider in allocations:
+            outcome = await self._release_allocation(
+                reservation_id=reservation_id,
+                allocation=allocation,
                 product_id=product_id,
-                provider_id=allocation.provider_id,
-                quantity=allocation.quantity,
+                provider=provider,
+                inventory_repository=inventory_repository,
             )
-            if released_inventory is None:
-                raise _InventoryReleaseError
-            allocation.status = AllocationStatus.RELEASED
+            if outcome is ProviderReleaseOutcome.RELEASED:
+                allocation.status = AllocationStatus.RELEASED
+            elif outcome is ProviderReleaseOutcome.UNKNOWN:
+                allocation.status = AllocationStatus.UNKNOWN
+                release_pending = True
+            else:
+                allocation.status = AllocationStatus.HELD
+                release_pending = True
 
-        reservation_model.status = ReservationStatusModel.CANCELLED
+        reservation_model.status = (
+            ReservationStatusModel.RELEASING
+            if release_pending
+            else ReservationStatusModel.CANCELLED
+        )
         await self._session.flush()
         return await self._to_domain(reservation_model)
+
+    async def _release_allocation(
+        self,
+        *,
+        reservation_id: UUID,
+        allocation: InventoryAllocationModel,
+        product_id: UUID,
+        provider: InventoryProviderModel,
+        inventory_repository: InventoryRepository,
+    ) -> ProviderReleaseOutcome:
+        if allocation.status is AllocationStatus.RELEASED:
+            return ProviderReleaseOutcome.RELEASED
+        if provider.kind is ProviderKind.EXTERNAL:
+            return await self._release_external_hold(
+                reservation_id=reservation_id,
+                allocation=allocation,
+                provider=provider,
+            )
+
+        released_inventory = await inventory_repository.release_hold(
+            product_id=product_id,
+            provider_id=allocation.provider_id,
+            quantity=allocation.quantity,
+        )
+        if released_inventory is None:
+            raise _InventoryReleaseError
+        return ProviderReleaseOutcome.RELEASED
+
+    async def _release_external_hold(
+        self,
+        *,
+        reservation_id: UUID,
+        allocation: InventoryAllocationModel,
+        provider: InventoryProviderModel,
+    ) -> ProviderReleaseOutcome:
+        if (
+            self._provider_registry is None
+            or not provider.supports_release
+            or provider.base_url is None
+            or provider.driver != "http"
+            or allocation.provider_hold_reference is None
+        ):
+            raise _InventoryReleaseError
+
+        idempotency_key = f"reservation:{reservation_id}:allocation:{allocation.id}:release"
+        operation_statement = (
+            select(ProviderOperationModel)
+            .where(ProviderOperationModel.idempotency_key == idempotency_key)
+            .with_for_update()
+        )
+        operation = (await self._session.scalars(operation_statement)).one_or_none()
+        if operation is not None:
+            if operation.status is ProviderOperationStatus.SUCCEEDED:
+                return ProviderReleaseOutcome.RELEASED
+            if operation.status is ProviderOperationStatus.UNKNOWN:
+                return ProviderReleaseOutcome.UNKNOWN
+            operation.status = ProviderOperationStatus.IN_PROGRESS
+            operation.attempt_count += 1
+            operation.error_code = None
+            operation.error_message = None
+        else:
+            operation = ProviderOperationModel(
+                allocation_id=allocation.id,
+                operation=ProviderOperationType.RELEASE,
+                status=ProviderOperationStatus.IN_PROGRESS,
+                idempotency_key=idempotency_key,
+                attempt_count=1,
+                external_reference=allocation.provider_hold_reference,
+            )
+            self._session.add(operation)
+        await self._session.flush()
+
+        external_provider = self._provider_registry.get_external(
+            provider_id=provider.id,
+            base_url=provider.base_url,
+            timeout=provider.request_timeout_ms / 1000,
+        )
+        attempt = await external_provider.release(
+            ReleaseCommand(
+                hold_reference=allocation.provider_hold_reference,
+                idempotency_key=idempotency_key,
+            )
+        )
+        if attempt.outcome is ProviderReleaseOutcome.RELEASED:
+            operation.status = ProviderOperationStatus.SUCCEEDED
+        elif attempt.outcome is ProviderReleaseOutcome.UNKNOWN:
+            operation.status = ProviderOperationStatus.UNKNOWN
+            operation.error_code = "unknown_outcome"
+            operation.error_message = "Provider release outcome is unknown."
+        else:
+            operation.status = ProviderOperationStatus.FAILED
+            operation.error_code = attempt.outcome.value
+            operation.error_message = "Provider did not release the hold."
+        return attempt.outcome
 
     async def _ensure_order(
         self,
