@@ -29,6 +29,7 @@ from inventory_reservation.repository.provider import ProviderRegistry
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.reservation import (
     ReconciliationWorkerConfig,
+    Reservation,
     ReservationItem,
     ReservationReconciliationRequiredError,
     ReservationReconciliationWorker,
@@ -129,6 +130,133 @@ async def assert_external_release_reconciliation(
         "/holds",
         "/holds/unknown-release-hold/release",
         "/holds/unknown-release-hold/release",
+    ]
+
+
+async def load_external_confirmation_state(
+    database: Database,
+    *,
+    reservation_id: UUID,
+) -> tuple[
+    InventoryAllocationModel,
+    ProviderOperationModel,
+    OrderModel | None,
+]:
+    async with database.session() as session:
+        allocation = (
+            await session.scalars(
+                select(InventoryAllocationModel)
+                .join(
+                    ReservationItemModel,
+                    ReservationItemModel.id == InventoryAllocationModel.reservation_item_id,
+                )
+                .where(ReservationItemModel.reservation_id == reservation_id)
+            )
+        ).one()
+        operation = (
+            await session.scalars(
+                select(ProviderOperationModel).where(
+                    ProviderOperationModel.allocation_id == allocation.id,
+                    ProviderOperationModel.operation == ProviderOperationType.CONFIRM,
+                )
+            )
+        ).one()
+        order = (
+            await session.scalars(
+                select(OrderModel).where(OrderModel.reservation_id == reservation_id)
+            )
+        ).one_or_none()
+        return allocation, operation, order
+
+
+async def assert_unknown_confirmation_persisted(
+    database: Database,
+    *,
+    reservation_id: UUID,
+    first_confirmation: Reservation | None,
+    repeated_confirmation: Reservation | None,
+    requests: list[str],
+) -> None:
+    allocation, operation, order = await load_external_confirmation_state(
+        database,
+        reservation_id=reservation_id,
+    )
+    assert first_confirmation is not None
+    assert repeated_confirmation == first_confirmation
+    assert first_confirmation.status is ReservationStatus.CONFIRMING
+    assert requests == [
+        "/holds",
+        "/holds/unknown-confirm-hold/confirm",
+    ]
+    assert allocation.status is AllocationStatus.UNKNOWN
+    assert order is None
+    assert (
+        operation.status,
+        operation.attempt_count,
+        operation.external_reference,
+    ) == (
+        ProviderOperationStatus.UNKNOWN,
+        1,
+        "unknown-confirm-hold",
+    )
+
+
+async def assert_external_confirmation_reconciliation(
+    database: Database,
+    *,
+    provider_registry: ProviderRegistry,
+    service: ReservationService,
+    reservation_id: UUID,
+    requests: list[str],
+) -> None:
+    exhausted_worker = ReservationReconciliationWorker(
+        transaction_factory=lambda: reservation_transaction(
+            database,
+            provider_registry,
+        ),
+        clock=FixedClock(),
+        config=ReconciliationWorkerConfig(
+            batch_size=10,
+            max_attempts=1,
+        ),
+    )
+    assert await exhausted_worker.run_once() == ()
+    assert requests == [
+        "/holds",
+        "/holds/unknown-confirm-hold/confirm",
+    ]
+
+    reconciliation_worker = ReservationReconciliationWorker(
+        transaction_factory=lambda: reservation_transaction(
+            database,
+            provider_registry,
+        ),
+        clock=FixedClock(),
+        config=ReconciliationWorkerConfig(
+            batch_size=10,
+            max_attempts=3,
+        ),
+    )
+    reconciled = await reconciliation_worker.run_once()
+    reconciled_reservation = await service.get(reservation_id)
+    allocation, operation, order = await load_external_confirmation_state(
+        database,
+        reservation_id=reservation_id,
+    )
+
+    assert [reservation.id for reservation in reconciled] == [reservation_id]
+    assert reconciled_reservation is not None
+    assert reconciled_reservation.status is ReservationStatus.CONFIRMED
+    assert allocation.status is AllocationStatus.CONFIRMED
+    assert order is not None
+    assert (operation.status, operation.attempt_count) == (
+        ProviderOperationStatus.SUCCEEDED,
+        2,
+    )
+    assert requests == [
+        "/holds",
+        "/holds/unknown-confirm-hold/confirm",
+        "/holds/unknown-confirm-hold/confirm",
     ]
 
 
@@ -347,30 +475,10 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                     user_id=user_id,
                 )
 
-                async with database.session() as session:
-                    allocation = (
-                        await session.scalars(
-                            select(InventoryAllocationModel)
-                            .join(
-                                ReservationItemModel,
-                                ReservationItemModel.id
-                                == InventoryAllocationModel.reservation_item_id,
-                            )
-                            .where(ReservationItemModel.reservation_id == reservation_id)
-                        )
-                    ).one()
-                    operation = (
-                        await session.scalars(
-                            select(ProviderOperationModel).where(
-                                ProviderOperationModel.allocation_id == allocation.id
-                            )
-                        )
-                    ).one()
-                    order = (
-                        await session.scalars(
-                            select(OrderModel).where(OrderModel.reservation_id == reservation_id)
-                        )
-                    ).one_or_none()
+                allocation, operation, order = await load_external_confirmation_state(
+                    database,
+                    reservation_id=reservation_id,
+                )
 
                 assert first_confirmation is not None
                 assert repeated_confirmation == first_confirmation
@@ -436,18 +544,23 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
     reservation_id = uuid7()
     user_id = uuid7()
     requests: list[str] = []
+    confirmation_attempts = 0
 
     async def external_provider_api(request: httpx.Request) -> httpx.Response:
+        nonlocal confirmation_attempts
         requests.append(request.url.path)
         if request.url.path == "/holds":
             return httpx.Response(
                 status_code=201,
                 json={"hold_reference": "unknown-confirm-hold"},
             )
-        raise httpx.ReadTimeout(
-            "Provider confirmation timed out",
-            request=request,
-        )
+        confirmation_attempts += 1
+        if confirmation_attempts == 1:
+            raise httpx.ReadTimeout(
+                "Provider confirmation timed out",
+                request=request,
+            )
+        return httpx.Response(status_code=204)
 
     try:
         async with httpx.AsyncClient(
@@ -513,51 +626,25 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                         user_id=user_id,
                     )
 
-                async with database.session() as session:
-                    allocation = (
-                        await session.scalars(
-                            select(InventoryAllocationModel)
-                            .join(
-                                ReservationItemModel,
-                                ReservationItemModel.id
-                                == InventoryAllocationModel.reservation_item_id,
-                            )
-                            .where(ReservationItemModel.reservation_id == reservation_id)
-                        )
-                    ).one()
-                    operation = (
-                        await session.scalars(
-                            select(ProviderOperationModel).where(
-                                ProviderOperationModel.allocation_id == allocation.id
-                            )
-                        )
-                    ).one()
-                    order = (
-                        await session.scalars(
-                            select(OrderModel).where(OrderModel.reservation_id == reservation_id)
-                        )
-                    ).one_or_none()
-
-                assert first_confirmation is not None
-                assert repeated_confirmation == first_confirmation
-                assert first_confirmation.status is ReservationStatus.CONFIRMING
-                assert requests == [
-                    "/holds",
-                    "/holds/unknown-confirm-hold/confirm",
-                ]
-                assert allocation.status is AllocationStatus.UNKNOWN
-                assert order is None
-                assert (
-                    operation.status,
-                    operation.attempt_count,
-                    operation.external_reference,
-                ) == (
-                    ProviderOperationStatus.UNKNOWN,
-                    1,
-                    "unknown-confirm-hold",
+                await assert_unknown_confirmation_persisted(
+                    database,
+                    reservation_id=reservation_id,
+                    first_confirmation=first_confirmation,
+                    repeated_confirmation=repeated_confirmation,
+                    requests=requests,
+                )
+                await assert_external_confirmation_reconciliation(
+                    database,
+                    provider_registry=provider_registry,
+                    service=service,
+                    reservation_id=reservation_id,
+                    requests=requests,
                 )
             finally:
                 async with database.session() as session, session.begin():
+                    await session.execute(
+                        delete(OrderModel).where(OrderModel.reservation_id == reservation_id)
+                    )
                     await session.execute(
                         delete(ReservationModel).where(ReservationModel.id == reservation_id)
                     )

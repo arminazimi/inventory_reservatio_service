@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,7 +60,7 @@ class _InventoryReleaseError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class _ReleaseContext:
+class _ProviderOperationContext:
     reservation_id: UUID
     retry_unknown: bool
     max_attempts: int
@@ -141,6 +141,19 @@ class SqlAlchemyReservationRepository:
         if reservation_model.status is ReservationStatusModel.CANCELLED:
             raise ReservationNotConfirmableError(reservation_id)
 
+        return await self._confirm_reservation(
+            reservation_model,
+            retry_unknown=False,
+            max_attempts=1,
+        )
+
+    async def _confirm_reservation(
+        self,
+        reservation: ReservationModel,
+        *,
+        retry_unknown: bool,
+        max_attempts: int,
+    ) -> Reservation | None:
         allocations_statement = (
             select(
                 InventoryAllocationModel,
@@ -155,7 +168,7 @@ class SqlAlchemyReservationRepository:
                 InventoryProviderModel,
                 InventoryProviderModel.id == InventoryAllocationModel.provider_id,
             )
-            .where(ReservationItemModel.reservation_id == reservation_id)
+            .where(ReservationItemModel.reservation_id == reservation.id)
             .with_for_update()
         )
         allocations = (await self._session.execute(allocations_statement)).all()
@@ -163,12 +176,17 @@ class SqlAlchemyReservationRepository:
             self._session,
             self._provider_registry,
         )
+        context = _ProviderOperationContext(
+            reservation_id=reservation.id,
+            retry_unknown=retry_unknown,
+            max_attempts=max_attempts,
+        )
         confirmation_pending = False
         confirmation_failed = False
 
         for allocation, product_id, provider in allocations:
             outcome = await self._confirm_allocation(
-                reservation_id=reservation_id,
+                context=context,
                 allocation=allocation,
                 product_id=product_id,
                 provider=provider,
@@ -187,14 +205,14 @@ class SqlAlchemyReservationRepository:
                 confirmation_pending = True
 
         if confirmation_failed:
-            reservation_model.status = ReservationStatusModel.FAILED
+            reservation.status = ReservationStatusModel.FAILED
         elif confirmation_pending:
-            reservation_model.status = ReservationStatusModel.CONFIRMING
+            reservation.status = ReservationStatusModel.CONFIRMING
         else:
-            reservation_model.status = ReservationStatusModel.CONFIRMED
-            await self._ensure_order(reservation_model)
+            reservation.status = ReservationStatusModel.CONFIRMED
+            await self._ensure_order(reservation)
         await self._session.flush()
-        return await self._to_domain(reservation_model)
+        return await self._to_domain(reservation)
 
     async def cancel(
         self,
@@ -258,7 +276,7 @@ class SqlAlchemyReservationRepository:
                 expired.append(reservation_domain)
         return tuple(expired)
 
-    async def reconcile_release_batch(
+    async def reconcile_batch(
         self,
         *,
         now: datetime,
@@ -277,12 +295,21 @@ class SqlAlchemyReservationRepository:
             )
             .where(
                 ReservationItemModel.reservation_id == ReservationModel.id,
-                ProviderOperationModel.operation == ProviderOperationType.RELEASE,
                 ProviderOperationModel.status == ProviderOperationStatus.UNKNOWN,
                 ProviderOperationModel.attempt_count < max_attempts,
                 or_(
                     ProviderOperationModel.next_attempt_at.is_(None),
                     ProviderOperationModel.next_attempt_at <= now,
+                ),
+                or_(
+                    and_(
+                        ReservationModel.status == ReservationStatusModel.RELEASING,
+                        ProviderOperationModel.operation == ProviderOperationType.RELEASE,
+                    ),
+                    and_(
+                        ReservationModel.status == ReservationStatusModel.CONFIRMING,
+                        ProviderOperationModel.operation == ProviderOperationType.CONFIRM,
+                    ),
                 ),
             )
             .exists()
@@ -290,12 +317,17 @@ class SqlAlchemyReservationRepository:
         statement = (
             select(ReservationModel)
             .where(
-                ReservationModel.status == ReservationStatusModel.RELEASING,
-                ReservationModel.release_target_status.in_(
-                    (
-                        ReservationStatusModel.CANCELLED,
-                        ReservationStatusModel.EXPIRED,
-                    )
+                or_(
+                    and_(
+                        ReservationModel.status == ReservationStatusModel.RELEASING,
+                        ReservationModel.release_target_status.in_(
+                            (
+                                ReservationStatusModel.CANCELLED,
+                                ReservationStatusModel.EXPIRED,
+                            )
+                        ),
+                    ),
+                    ReservationModel.status == ReservationStatusModel.CONFIRMING,
                 ),
                 has_reconcilable_operation,
             )
@@ -305,15 +337,22 @@ class SqlAlchemyReservationRepository:
         )
         reservations = (await self._session.scalars(statement)).all()
         for reservation in reservations:
-            terminal_status = reservation.release_target_status
-            if terminal_status is None:
-                continue
-            await self._release_reservation(
-                reservation,
-                terminal_status=terminal_status,
-                retry_unknown=True,
-                max_attempts=max_attempts,
-            )
+            if reservation.status is ReservationStatusModel.RELEASING:
+                terminal_status = reservation.release_target_status
+                if terminal_status is None:
+                    continue
+                await self._release_reservation(
+                    reservation,
+                    terminal_status=terminal_status,
+                    retry_unknown=True,
+                    max_attempts=max_attempts,
+                )
+            elif reservation.status is ReservationStatusModel.CONFIRMING:
+                await self._confirm_reservation(
+                    reservation,
+                    retry_unknown=True,
+                    max_attempts=max_attempts,
+                )
 
         await self._session.flush()
         reconciled: list[Reservation] = []
@@ -354,7 +393,7 @@ class SqlAlchemyReservationRepository:
             self._provider_registry,
         )
         release_pending = False
-        release_context = _ReleaseContext(
+        release_context = _ProviderOperationContext(
             reservation_id=reservation.id,
             retry_unknown=retry_unknown,
             max_attempts=max_attempts,
@@ -387,7 +426,7 @@ class SqlAlchemyReservationRepository:
     async def _release_allocation(
         self,
         *,
-        context: _ReleaseContext,
+        context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         product_id: UUID,
         provider: InventoryProviderModel,
@@ -414,7 +453,7 @@ class SqlAlchemyReservationRepository:
     async def _release_external_hold(
         self,
         *,
-        context: _ReleaseContext,
+        context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         provider: InventoryProviderModel,
     ) -> ProviderReleaseOutcome:
@@ -516,7 +555,7 @@ class SqlAlchemyReservationRepository:
     async def _confirm_allocation(
         self,
         *,
-        reservation_id: UUID,
+        context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         product_id: UUID,
         provider: InventoryProviderModel,
@@ -526,7 +565,7 @@ class SqlAlchemyReservationRepository:
             return ProviderConfirmOutcome.CONFIRMED
         if provider.kind is ProviderKind.EXTERNAL:
             return await self._confirm_external_hold(
-                reservation_id=reservation_id,
+                context=context,
                 allocation=allocation,
                 provider=provider,
             )
@@ -543,7 +582,7 @@ class SqlAlchemyReservationRepository:
     async def _confirm_external_hold(
         self,
         *,
-        reservation_id: UUID,
+        context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         provider: InventoryProviderModel,
     ) -> ProviderConfirmOutcome:
@@ -556,7 +595,7 @@ class SqlAlchemyReservationRepository:
         ):
             raise _InventoryConfirmationError
 
-        idempotency_key = f"reservation:{reservation_id}:allocation:{allocation.id}:confirm"
+        idempotency_key = f"reservation:{context.reservation_id}:allocation:{allocation.id}:confirm"
         operation_statement = (
             select(ProviderOperationModel)
             .where(ProviderOperationModel.idempotency_key == idempotency_key)
@@ -566,7 +605,9 @@ class SqlAlchemyReservationRepository:
         if operation is not None:
             if operation.status is ProviderOperationStatus.SUCCEEDED:
                 return ProviderConfirmOutcome.CONFIRMED
-            if operation.status is ProviderOperationStatus.UNKNOWN:
+            if operation.status is ProviderOperationStatus.UNKNOWN and (
+                not context.retry_unknown or operation.attempt_count >= context.max_attempts
+            ):
                 return ProviderConfirmOutcome.UNKNOWN
             operation.status = ProviderOperationStatus.IN_PROGRESS
             operation.attempt_count += 1

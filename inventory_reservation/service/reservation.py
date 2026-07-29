@@ -170,7 +170,7 @@ class ReservationRepositoryPort(Protocol):
         limit: int,
     ) -> tuple[Reservation, ...]: ...
 
-    async def reconcile_release_batch(
+    async def reconcile_batch(
         self,
         *,
         now: datetime,
@@ -428,7 +428,7 @@ class ReservationReconciliationWorker:
 
     async def run_once(self) -> tuple[Reservation, ...]:
         async with self._transaction_factory() as repository:
-            return await repository.reconcile_release_batch(
+            return await repository.reconcile_batch(
                 now=self._clock.now(),
                 limit=self._config.batch_size,
                 max_attempts=self._config.max_attempts,
