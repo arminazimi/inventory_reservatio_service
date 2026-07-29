@@ -278,7 +278,10 @@ class ReservationModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint("length(idempotency_key) > 0", name="idempotency_key_not_empty"),
         CheckConstraint("length(request_fingerprint) = 64", name="request_fingerprint_sha256"),
         CheckConstraint(
-            "release_target_status IS NULL OR release_target_status IN ('cancelled', 'expired')",
+            (
+                "release_target_status IS NULL OR "
+                "release_target_status IN ('cancelled', 'expired', 'failed')"
+            ),
             name="valid_release_target_status",
         ),
         CheckConstraint("version >= 1", name="positive_version"),

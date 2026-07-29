@@ -47,10 +47,6 @@ from inventory_reservation.service.reservation import (
 IDEMPOTENCY_CONSTRAINT = "uq_reservations_user_id_idempotency_key"
 
 
-class _InsufficientInventoryError(RuntimeError):
-    pass
-
-
 class _InventoryConfirmationError(RuntimeError):
     pass
 
@@ -90,40 +86,45 @@ class SqlAlchemyReservationRepository:
         self._session.add(self._to_model(reservation))
 
     async def add_with_hold(self, reservation: Reservation) -> bool:
-        try:
-            async with self._session.begin_nested():
-                reservation_model = self._to_model(reservation)
-                self._session.add(reservation_model)
-                await self._session.flush()
+        reservation_model = self._to_model(reservation)
+        self._session.add(reservation_model)
+        await self._session.flush()
 
-                inventory_repository = InventoryRepository(
-                    self._session,
-                    self._provider_registry,
+        inventory_repository = InventoryRepository(
+            self._session,
+            self._provider_registry,
+        )
+        for item_model in reservation_model.items:
+            hold_idempotency_key = (
+                f"reservation:{reservation.id}:product:{item_model.product_id}:hold"
+            )
+            hold = await inventory_repository.try_hold_available(
+                product_id=item_model.product_id,
+                quantity=item_model.requested_quantity,
+                idempotency_key=hold_idempotency_key,
+            )
+            if hold is None:
+                reservation_model.failure_code = "insufficient_inventory"
+                reservation_model.failure_reason = (
+                    "A later reservation item could not be allocated."
                 )
-                for item_model in reservation_model.items:
-                    hold_idempotency_key = (
-                        f"reservation:{reservation.id}:product:{item_model.product_id}:hold"
-                    )
-                    hold = await inventory_repository.try_hold_available(
-                        product_id=item_model.product_id,
-                        quantity=item_model.requested_quantity,
-                        idempotency_key=hold_idempotency_key,
-                    )
-                    if hold is None:
-                        raise _InsufficientInventoryError
+                await self._release_reservation(
+                    reservation_model,
+                    terminal_status=ReservationStatusModel.FAILED,
+                )
+                await self._session.flush()
+                return False
 
-                    self._session.add(
-                        InventoryAllocationModel(
-                            reservation_item_id=item_model.id,
-                            provider_id=hold.provider_id,
-                            quantity=item_model.requested_quantity,
-                            status=AllocationStatus.HELD,
-                            hold_idempotency_key=hold_idempotency_key,
-                            provider_hold_reference=hold.reference,
-                        )
-                    )
-        except _InsufficientInventoryError:
-            return False
+            self._session.add(
+                InventoryAllocationModel(
+                    reservation_item_id=item_model.id,
+                    provider_id=hold.provider_id,
+                    quantity=item_model.requested_quantity,
+                    status=AllocationStatus.HELD,
+                    hold_idempotency_key=hold_idempotency_key,
+                    provider_hold_reference=hold.reference,
+                )
+            )
 
         return True
 
@@ -331,6 +332,7 @@ class SqlAlchemyReservationRepository:
                             (
                                 ReservationStatusModel.CANCELLED,
                                 ReservationStatusModel.EXPIRED,
+                                ReservationStatusModel.FAILED,
                             )
                         ),
                     ),
@@ -677,6 +679,11 @@ class SqlAlchemyReservationRepository:
             status=ReservationStatusModel(reservation.status.value),
             expires_at=reservation.expires_at,
             created_at=reservation.created_at,
+            release_target_status=(
+                ReservationStatusModel(reservation.release_target_status.value)
+                if reservation.release_target_status is not None
+                else None
+            ),
         )
         reservation_model.items = [
             ReservationItemModel(
@@ -737,6 +744,11 @@ class SqlAlchemyReservationRepository:
             created_at=reservation_model.created_at,
             expires_at=reservation_model.expires_at,
             status=ReservationStatus(reservation_model.status.value),
+            release_target_status=(
+                ReservationStatus(reservation_model.release_target_status.value)
+                if reservation_model.release_target_status is not None
+                else None
+            ),
         )
 
 

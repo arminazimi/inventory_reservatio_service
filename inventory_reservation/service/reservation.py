@@ -104,6 +104,7 @@ class Reservation:
     created_at: datetime
     expires_at: datetime
     status: ReservationStatus = ReservationStatus.PENDING
+    release_target_status: ReservationStatus | None = None
 
     def __post_init__(self) -> None:
         if not self.items:
@@ -130,7 +131,11 @@ class Reservation:
             return self
         if self.status is ReservationStatus.CANCELLED:
             raise ReservationNotConfirmableError(self.id)
-        return replace(self, status=ReservationStatus.CONFIRMED)
+        return replace(
+            self,
+            status=ReservationStatus.CONFIRMED,
+            release_target_status=None,
+        )
 
     def cancel(self) -> Reservation:
         if self.status is ReservationStatus.CANCELLED:
@@ -139,7 +144,11 @@ class Reservation:
             raise ReservationNotCancellableError(self.id)
         if self.status is ReservationStatus.CONFIRMING:
             raise ReservationReconciliationRequiredError(self.id)
-        return replace(self, status=ReservationStatus.CANCELLED)
+        return replace(
+            self,
+            status=ReservationStatus.CANCELLED,
+            release_target_status=None,
+        )
 
 
 class Clock(Protocol):
@@ -293,9 +302,6 @@ class ReservationService:
                     )
                 )
                 inventory_held = await repository.add_with_hold(reservation)
-                if not inventory_held:
-                    raise InsufficientInventoryError(items)
-                return reservation
         except ConcurrentReservationCreationError:
             async with self._transaction_factory() as repository:
                 existing = await repository.get_by_idempotency_key(
@@ -309,6 +315,10 @@ class ReservationService:
                 idempotency_key=idempotency_key,
                 request_fingerprint=request_fingerprint,
             )
+
+        if not inventory_held:
+            raise InsufficientInventoryError(items)
+        return reservation
 
     async def get(self, reservation_id: UUID) -> Reservation | None:
         async with self._transaction_factory() as repository:
@@ -545,4 +555,9 @@ def _resolve_idempotent_retry(
 ) -> Reservation:
     if existing.request_fingerprint != request_fingerprint:
         raise IdempotencyConflictError(idempotency_key, existing.id)
+    if (
+        existing.status is ReservationStatus.FAILED
+        or existing.release_target_status is ReservationStatus.FAILED
+    ):
+        raise InsufficientInventoryError(existing.items)
     return existing

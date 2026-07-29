@@ -247,8 +247,9 @@ When provider latency causes long transactions or pool saturation:
 4. perform the remote operation with the deterministic key;
 5. finalize the reservation in another short locked transaction.
 
-This also creates the right place for per-provider bulkheads, rate limits,
-compensation, and unknown-hold reconciliation. Client contracts must explicitly
+This moves the existing compensating-release workflow out of a long
+transaction and creates the right place for per-provider bulkheads, rate
+limits, and unknown-hold reconciliation. Client contracts must explicitly
 accept an asynchronous `reserving`/`confirming` result.
 
 ### Stage 3: split ownership, not transactions
@@ -325,10 +326,10 @@ scalable or production-certified. Its explicit limits are:
 - hot inventory rows serialize writes;
 - no per-provider concurrency or rate-limit isolation;
 - process-local circuit state;
-- no durable compensation for a successful early external hold when a later
-  item in the same reservation fails;
-- unknown initial hold outcomes are not reconciled through
-  `provider_operations`;
+- compensating releases are durable, but the initial hold intent is not
+  committed before calling the provider;
+- unknown initial hold outcomes and a crash between provider success and local
+  allocation persistence are not reconciled through `provider_operations`;
 - exhausted retries require manual database/operational investigation;
 - disaster recovery, backup restore objectives, and multi-region failover are
   deployment concerns not implemented here.

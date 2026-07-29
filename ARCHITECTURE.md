@@ -134,6 +134,14 @@ uses the provider hold contract and stores its hold reference in the
 allocation. The current model assigns the entire quantity of one item to one
 provider; it does not split a line across sources.
 
+If a later item cannot be allocated, every earlier allocation is compensated.
+Internal holds are returned and external holds are released with deterministic
+keys. The failed reservation is committed so a repeated create request returns
+the same insufficient-inventory result without holding stock again. If an
+external compensating release times out, the reservation remains durably
+`releasing` with `failed` as its target and the reconciliation worker completes
+it after backoff.
+
 ### Confirm reservation
 
 The repository locks the reservation and its allocations. Internal
@@ -268,16 +276,16 @@ The first change would be to move external calls out of long-held PostgreSQL
 transactions. I would persist an operation intent first, commit it, execute the
 remote call, and then apply the result in a second short transaction. A
 transactional outbox or durable workflow engine could dispatch the intent.
-That design needs explicit `reserving`, compensation, and client-observation
-semantics rather than being added as an invisible optimization.
+That design needs explicit `reserving` and client-observation semantics rather
+than being added as an invisible optimization.
 
-The most important correctness extension is a saga for multi-item external
-holds. In the current synchronous implementation, an early external item can
-be held before a later item fails, while rolling back PostgreSQL cannot roll
-back the external provider. The next version should durably record every hold
-attempt and issue compensating releases for all conclusive prior holds. Unknown
-hold outcomes also need their own reconciliation path or a provider status
-query before another source can be tried.
+Multi-item checkout now compensates every conclusive earlier hold when a later
+item fails, and an unknown compensating release is durable and reconcilable.
+The remaining correctness gap is before that point: the initial external hold
+intent is not committed before the provider call. A timeout—or a process crash
+after the provider accepts the hold but before its allocation is saved—needs a
+durable hold operation plus a provider status query or an unknown-hold
+reconciliation path.
 
 Other follow-up work, in order, would be:
 

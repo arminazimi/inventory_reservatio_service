@@ -33,8 +33,8 @@ identity if index size becomes a measured bottleneck.
 - Allocation and order quantities must be positive.
 - Each provider operation has a unique idempotency key.
 - A reservation in `releasing` stores a constrained `release_target_status`
-  (`cancelled` or `expired`) so reconciliation can finish the original
-  transition after a restart.
+  (`cancelled`, `expired`, or `failed`) so reconciliation can finish the
+  original transition or a compensating release after a restart.
 - `orders.reservation_id` is unique, preventing duplicate orders.
 - Actual provider secrets are not stored; `secret_ref` points to environment or
   secret-manager material.

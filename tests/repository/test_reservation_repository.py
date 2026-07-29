@@ -329,7 +329,7 @@ async def test_service_transaction_commits_idempotent_reservation() -> None:
 
 
 @pytest.mark.integration
-async def test_insufficient_inventory_rolls_back_reservation_and_previous_holds() -> None:
+async def test_insufficient_inventory_releases_previous_holds_and_persists_failure() -> None:
     database = Database(
         os.getenv(
             "DATABASE_URL",
@@ -408,14 +408,10 @@ async def test_insufficient_inventory_rolls_back_reservation_and_previous_holds(
                     provider_id=provider_id,
                 )
 
-            assert persisted is None
-            assert inventory == InventorySnapshot(
-                product_id=available_product_id,
-                provider_id=provider_id,
-                on_hand=2,
-                reserved=0,
-                version=1,
-            )
+            assert persisted is not None
+            assert persisted.status is ReservationStatus.FAILED
+            assert inventory is not None
+            assert (inventory.on_hand, inventory.reserved) == (2, 0)
         finally:
             async with database.session() as session, session.begin():
                 await session.execute(
