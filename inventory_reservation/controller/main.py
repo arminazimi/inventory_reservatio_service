@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import uuid7
 
+import httpx
 from fastapi import FastAPI
 from starlette.types import Lifespan
 
@@ -15,6 +16,7 @@ from inventory_reservation.controller.reservation import (
     handle_reservation_not_found,
 )
 from inventory_reservation.repository.database import Database
+from inventory_reservation.repository.provider import ProviderRegistry
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.reservation import (
     IdempotencyConflictError,
@@ -24,6 +26,8 @@ from inventory_reservation.service.reservation import (
 
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory"
 DEFAULT_RESERVATION_TTL_SECONDS = 900
+DEFAULT_PROVIDER_FAILURE_THRESHOLD = 3
+DEFAULT_PROVIDER_RECOVERY_TIMEOUT_SECONDS = 30.0
 
 
 class UtcClock:
@@ -57,10 +61,32 @@ def create_app(
     return app
 
 
-def build_app() -> FastAPI:
+def build_app(
+    *,
+    provider_http_client: httpx.AsyncClient | None = None,
+) -> FastAPI:
     database = Database(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL))
+    http_client = provider_http_client if provider_http_client is not None else httpx.AsyncClient()
+    provider_registry = ProviderRegistry(
+        client=http_client,
+        failure_threshold=int(
+            os.getenv(
+                "PROVIDER_FAILURE_THRESHOLD",
+                str(DEFAULT_PROVIDER_FAILURE_THRESHOLD),
+            )
+        ),
+        recovery_timeout=float(
+            os.getenv(
+                "PROVIDER_RECOVERY_TIMEOUT_SECONDS",
+                str(DEFAULT_PROVIDER_RECOVERY_TIMEOUT_SECONDS),
+            )
+        ),
+    )
     reservation_service = ReservationService(
-        transaction_factory=lambda: reservation_transaction(database),
+        transaction_factory=lambda: reservation_transaction(
+            database,
+            provider_registry,
+        ),
         clock=UtcClock(),
         reservation_id_factory=uuid7,
         ttl=timedelta(
@@ -75,8 +101,13 @@ def build_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        await database.close()
+        try:
+            yield
+        finally:
+            try:
+                await http_client.aclose()
+            finally:
+                await database.close()
 
     return create_app(
         reservation_service=reservation_service,

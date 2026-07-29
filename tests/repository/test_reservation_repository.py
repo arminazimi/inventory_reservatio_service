@@ -49,8 +49,8 @@ class SynchronizingReservationRepository:
         self._repository = repository
         self._barrier = barrier
 
-    async def add_with_internal_hold(self, reservation: Reservation) -> bool:
-        return await self._repository.add_with_internal_hold(reservation)
+    async def add_with_hold(self, reservation: Reservation) -> bool:
+        return await self._repository.add_with_hold(reservation)
 
     async def get(self, reservation_id: UUID) -> Reservation | None:
         return await self._repository.get(reservation_id)
