@@ -6,9 +6,11 @@ from pydantic import BaseModel, ConfigDict
 
 from inventory_reservation.service.provider import (
     CircuitBreakerProvider,
+    ConfirmCommand,
     HoldCommand,
-    HoldProvider,
+    InventoryProvider,
     ProviderCallFailedError,
+    ProviderConfirmAttempt,
     ProviderHoldAttempt,
 )
 
@@ -58,6 +60,27 @@ class HttpInventoryProvider:
         payload = _HoldResponse.model_validate(response.json())
         return ProviderHoldAttempt.held(reference=payload.hold_reference)
 
+    async def confirm(self, command: ConfirmCommand) -> ProviderConfirmAttempt:
+        try:
+            response = await self._client.post(
+                f"{self._hold_url}/{command.hold_reference}/confirm",
+                headers={"Idempotency-Key": command.idempotency_key},
+                timeout=self._timeout,
+            )
+        except httpx.TimeoutException:
+            return ProviderConfirmAttempt.unknown()
+
+        if response.status_code in {
+            httpx.codes.NOT_FOUND,
+            httpx.codes.CONFLICT,
+        }:
+            return ProviderConfirmAttempt.rejected()
+        if response.is_server_error:
+            raise ProviderCallFailedError(self.provider_id)
+
+        response.raise_for_status()
+        return ProviderConfirmAttempt.confirmed()
+
 
 @dataclass(frozen=True, slots=True)
 class _ExternalProviderSettings:
@@ -80,7 +103,7 @@ class ProviderRegistry:
         self._recovery_timeout = recovery_timeout
         self._providers: dict[
             UUID,
-            tuple[_ExternalProviderSettings, HoldProvider],
+            tuple[_ExternalProviderSettings, InventoryProvider],
         ] = {}
 
     def get_external(
@@ -89,7 +112,7 @@ class ProviderRegistry:
         provider_id: UUID,
         base_url: str,
         timeout: float,
-    ) -> HoldProvider:
+    ) -> InventoryProvider:
         settings = _ExternalProviderSettings(
             base_url=base_url,
             timeout=timeout,

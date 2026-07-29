@@ -97,6 +97,41 @@ class InventoryRepository:
             version=level.version,
         )
 
+    async def confirm_hold(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+        quantity: int,
+    ) -> InventorySnapshot | None:
+        statement = (
+            update(InventoryLevelModel)
+            .where(
+                InventoryLevelModel.product_id == product_id,
+                InventoryLevelModel.provider_id == provider_id,
+                InventoryLevelModel.on_hand >= quantity,
+                InventoryLevelModel.reserved >= quantity,
+            )
+            .values(
+                on_hand=InventoryLevelModel.on_hand - quantity,
+                reserved=InventoryLevelModel.reserved - quantity,
+                version=InventoryLevelModel.version + 1,
+            )
+            .returning(InventoryLevelModel)
+        )
+        level = (await self._session.scalars(statement)).one_or_none()
+
+        if level is None:
+            return None
+
+        return InventorySnapshot(
+            product_id=level.product_id,
+            provider_id=level.provider_id,
+            on_hand=level.on_hand,
+            reserved=level.reserved,
+            version=level.version,
+        )
+
     async def try_hold_available(
         self,
         *,

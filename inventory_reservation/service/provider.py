@@ -13,10 +13,23 @@ class ProviderHoldOutcome(StrEnum):
     UNKNOWN = "unknown"
 
 
+class ProviderConfirmOutcome(StrEnum):
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class HoldCommand:
     product_id: UUID
     quantity: int
+    idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmCommand:
+    hold_reference: str
     idempotency_key: str
 
 
@@ -46,6 +59,27 @@ class ProviderHoldAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderConfirmAttempt:
+    outcome: ProviderConfirmOutcome
+
+    @classmethod
+    def confirmed(cls) -> ProviderConfirmAttempt:
+        return cls(outcome=ProviderConfirmOutcome.CONFIRMED)
+
+    @classmethod
+    def rejected(cls) -> ProviderConfirmAttempt:
+        return cls(outcome=ProviderConfirmOutcome.REJECTED)
+
+    @classmethod
+    def temporarily_unavailable(cls) -> ProviderConfirmAttempt:
+        return cls(outcome=ProviderConfirmOutcome.TEMPORARILY_UNAVAILABLE)
+
+    @classmethod
+    def unknown(cls) -> ProviderConfirmAttempt:
+        return cls(outcome=ProviderConfirmOutcome.UNKNOWN)
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderHold:
     provider_id: UUID
     reference: str | None = None
@@ -58,6 +92,17 @@ class HoldProvider(Protocol):
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt: ...
 
 
+class ConfirmProvider(Protocol):
+    @property
+    def provider_id(self) -> UUID: ...
+
+    async def confirm(self, command: ConfirmCommand) -> ProviderConfirmAttempt: ...
+
+
+class InventoryProvider(HoldProvider, ConfirmProvider, Protocol):
+    pass
+
+
 class ProviderCallFailedError(RuntimeError):
     def __init__(self, provider_id: UUID) -> None:
         self.provider_id = provider_id
@@ -68,7 +113,7 @@ class CircuitBreakerProvider:
     def __init__(
         self,
         *,
-        provider: HoldProvider,
+        provider: InventoryProvider,
         failure_threshold: int,
         recovery_timeout: float = 30.0,
         monotonic: Callable[[], float] = time.monotonic,
@@ -102,6 +147,38 @@ class CircuitBreakerProvider:
                 return ProviderHoldAttempt.temporarily_unavailable()
 
             if attempt.outcome is ProviderHoldOutcome.UNKNOWN:
+                self._failure_count += 1
+                if self._failure_count >= self._failure_threshold:
+                    self._opened_at = self._monotonic()
+                return attempt
+
+            self._failure_count = 0
+            self._opened_at = None
+            return attempt
+        finally:
+            if is_probe:
+                self._probe_in_flight = False
+
+    async def confirm(self, command: ConfirmCommand) -> ProviderConfirmAttempt:
+        is_probe = False
+        if self._opened_at is not None:
+            if self._monotonic() - self._opened_at < self._recovery_timeout:
+                return ProviderConfirmAttempt.temporarily_unavailable()
+            if self._probe_in_flight:
+                return ProviderConfirmAttempt.temporarily_unavailable()
+            self._probe_in_flight = True
+            is_probe = True
+
+        try:
+            try:
+                attempt = await self._provider.confirm(command)
+            except ProviderCallFailedError:
+                self._failure_count += 1
+                if self._failure_count >= self._failure_threshold:
+                    self._opened_at = self._monotonic()
+                return ProviderConfirmAttempt.temporarily_unavailable()
+
+            if attempt.outcome is ProviderConfirmOutcome.UNKNOWN:
                 self._failure_count += 1
                 if self._failure_count >= self._failure_threshold:
                     self._opened_at = self._monotonic()

@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
@@ -39,6 +39,9 @@ class ConcurrentReservationCreationError(RuntimeError):
 
 class ReservationStatus(StrEnum):
     PENDING = "pending"
+    CONFIRMING = "confirming"
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,10 +80,7 @@ class Reservation:
     request_fingerprint: str
     created_at: datetime
     expires_at: datetime
-    status: ReservationStatus = field(
-        default=ReservationStatus.PENDING,
-        init=False,
-    )
+    status: ReservationStatus = ReservationStatus.PENDING
 
     def __post_init__(self) -> None:
         if not self.items:
@@ -102,6 +102,11 @@ class Reservation:
             expires_at=draft.now + draft.ttl,
         )
 
+    def confirm(self) -> Reservation:
+        if self.status is ReservationStatus.CONFIRMED:
+            return self
+        return replace(self, status=ReservationStatus.CONFIRMED)
+
 
 class Clock(Protocol):
     def now(self) -> datetime: ...
@@ -109,6 +114,13 @@ class Clock(Protocol):
 
 class ReservationRepositoryPort(Protocol):
     async def add_with_hold(self, reservation: Reservation) -> bool: ...
+
+    async def confirm(
+        self,
+        *,
+        reservation_id: UUID,
+        user_id: UUID,
+    ) -> Reservation | None: ...
 
     async def get(self, reservation_id: UUID) -> Reservation | None: ...
 
@@ -194,6 +206,18 @@ class ReservationService:
     async def get(self, reservation_id: UUID) -> Reservation | None:
         async with self._transaction_factory() as repository:
             return await repository.get(reservation_id)
+
+    async def confirm(
+        self,
+        *,
+        reservation_id: UUID,
+        user_id: UUID,
+    ) -> Reservation | None:
+        async with self._transaction_factory() as repository:
+            return await repository.confirm(
+                reservation_id=reservation_id,
+                user_id=user_id,
+            )
 
 
 def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:

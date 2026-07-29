@@ -11,6 +11,11 @@ from inventory_reservation.repository.inventory import InventoryRepository
 from inventory_reservation.repository.models import (
     AllocationStatus,
     InventoryAllocationModel,
+    InventoryProviderModel,
+    ProviderKind,
+    ProviderOperationModel,
+    ProviderOperationStatus,
+    ProviderOperationType,
     ReservationItemModel,
     ReservationModel,
 )
@@ -18,17 +23,26 @@ from inventory_reservation.repository.models import (
     ReservationStatus as ReservationStatusModel,
 )
 from inventory_reservation.repository.provider import ProviderRegistry
+from inventory_reservation.service.provider import (
+    ConfirmCommand,
+    ProviderConfirmOutcome,
+)
 from inventory_reservation.service.reservation import (
     ConcurrentReservationCreationError,
     Reservation,
     ReservationItem,
     ReservationRepositoryPort,
+    ReservationStatus,
 )
 
 IDEMPOTENCY_CONSTRAINT = "uq_reservations_user_id_idempotency_key"
 
 
 class _InsufficientInventoryError(RuntimeError):
+    pass
+
+
+class _InventoryConfirmationError(RuntimeError):
     pass
 
 
@@ -83,6 +97,174 @@ class SqlAlchemyReservationRepository:
             return False
 
         return True
+
+    async def confirm(
+        self,
+        *,
+        reservation_id: UUID,
+        user_id: UUID,
+    ) -> Reservation | None:
+        reservation_statement = (
+            select(ReservationModel)
+            .where(
+                ReservationModel.id == reservation_id,
+                ReservationModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        reservation_model = (await self._session.scalars(reservation_statement)).one_or_none()
+        if reservation_model is None:
+            return None
+        if reservation_model.status is ReservationStatusModel.CONFIRMED:
+            return await self._to_domain(reservation_model)
+
+        allocations_statement = (
+            select(
+                InventoryAllocationModel,
+                ReservationItemModel.product_id,
+                InventoryProviderModel,
+            )
+            .join(
+                ReservationItemModel,
+                ReservationItemModel.id == InventoryAllocationModel.reservation_item_id,
+            )
+            .join(
+                InventoryProviderModel,
+                InventoryProviderModel.id == InventoryAllocationModel.provider_id,
+            )
+            .where(ReservationItemModel.reservation_id == reservation_id)
+            .with_for_update()
+        )
+        allocations = (await self._session.execute(allocations_statement)).all()
+        inventory_repository = InventoryRepository(
+            self._session,
+            self._provider_registry,
+        )
+        confirmation_pending = False
+        confirmation_failed = False
+
+        for allocation, product_id, provider in allocations:
+            outcome = await self._confirm_allocation(
+                reservation_id=reservation_id,
+                allocation=allocation,
+                product_id=product_id,
+                provider=provider,
+                inventory_repository=inventory_repository,
+            )
+            if outcome is ProviderConfirmOutcome.CONFIRMED:
+                allocation.status = AllocationStatus.CONFIRMED
+            elif outcome is ProviderConfirmOutcome.REJECTED:
+                allocation.status = AllocationStatus.FAILED
+                confirmation_failed = True
+            elif outcome is ProviderConfirmOutcome.UNKNOWN:
+                allocation.status = AllocationStatus.UNKNOWN
+                confirmation_pending = True
+            else:
+                allocation.status = AllocationStatus.HELD
+                confirmation_pending = True
+
+        if confirmation_failed:
+            reservation_model.status = ReservationStatusModel.FAILED
+        elif confirmation_pending:
+            reservation_model.status = ReservationStatusModel.CONFIRMING
+        else:
+            reservation_model.status = ReservationStatusModel.CONFIRMED
+        await self._session.flush()
+        return await self._to_domain(reservation_model)
+
+    async def _confirm_allocation(
+        self,
+        *,
+        reservation_id: UUID,
+        allocation: InventoryAllocationModel,
+        product_id: UUID,
+        provider: InventoryProviderModel,
+        inventory_repository: InventoryRepository,
+    ) -> ProviderConfirmOutcome:
+        if allocation.status is AllocationStatus.CONFIRMED:
+            return ProviderConfirmOutcome.CONFIRMED
+        if provider.kind is ProviderKind.EXTERNAL:
+            return await self._confirm_external_hold(
+                reservation_id=reservation_id,
+                allocation=allocation,
+                provider=provider,
+            )
+
+        confirmed_inventory = await inventory_repository.confirm_hold(
+            product_id=product_id,
+            provider_id=allocation.provider_id,
+            quantity=allocation.quantity,
+        )
+        if confirmed_inventory is None:
+            raise _InventoryConfirmationError
+        return ProviderConfirmOutcome.CONFIRMED
+
+    async def _confirm_external_hold(
+        self,
+        *,
+        reservation_id: UUID,
+        allocation: InventoryAllocationModel,
+        provider: InventoryProviderModel,
+    ) -> ProviderConfirmOutcome:
+        if (
+            self._provider_registry is None
+            or not provider.supports_confirm
+            or provider.base_url is None
+            or provider.driver != "http"
+            or allocation.provider_hold_reference is None
+        ):
+            raise _InventoryConfirmationError
+
+        idempotency_key = f"reservation:{reservation_id}:allocation:{allocation.id}:confirm"
+        operation_statement = (
+            select(ProviderOperationModel)
+            .where(ProviderOperationModel.idempotency_key == idempotency_key)
+            .with_for_update()
+        )
+        operation = (await self._session.scalars(operation_statement)).one_or_none()
+        if operation is not None:
+            if operation.status is ProviderOperationStatus.SUCCEEDED:
+                return ProviderConfirmOutcome.CONFIRMED
+            if operation.status is ProviderOperationStatus.UNKNOWN:
+                return ProviderConfirmOutcome.UNKNOWN
+            operation.status = ProviderOperationStatus.IN_PROGRESS
+            operation.attempt_count += 1
+            operation.error_code = None
+            operation.error_message = None
+        else:
+            operation = ProviderOperationModel(
+                allocation_id=allocation.id,
+                operation=ProviderOperationType.CONFIRM,
+                status=ProviderOperationStatus.IN_PROGRESS,
+                idempotency_key=idempotency_key,
+                attempt_count=1,
+                external_reference=allocation.provider_hold_reference,
+            )
+            self._session.add(operation)
+        await self._session.flush()
+
+        external_provider = self._provider_registry.get_external(
+            provider_id=provider.id,
+            base_url=provider.base_url,
+            timeout=provider.request_timeout_ms / 1000,
+        )
+        attempt = await external_provider.confirm(
+            ConfirmCommand(
+                hold_reference=allocation.provider_hold_reference,
+                idempotency_key=idempotency_key,
+            )
+        )
+        if attempt.outcome is ProviderConfirmOutcome.CONFIRMED:
+            operation.status = ProviderOperationStatus.SUCCEEDED
+        elif attempt.outcome is ProviderConfirmOutcome.UNKNOWN:
+            operation.status = ProviderOperationStatus.UNKNOWN
+            operation.error_code = "unknown_outcome"
+            operation.error_message = "Provider confirmation outcome is unknown."
+        else:
+            operation.status = ProviderOperationStatus.FAILED
+            operation.error_code = attempt.outcome.value
+            operation.error_message = "Provider did not confirm the hold."
+        return attempt.outcome
 
     @staticmethod
     def _to_model(reservation: Reservation) -> ReservationModel:
@@ -153,6 +335,7 @@ class SqlAlchemyReservationRepository:
             request_fingerprint=reservation_model.request_fingerprint,
             created_at=reservation_model.created_at,
             expires_at=reservation_model.expires_at,
+            status=ReservationStatus(reservation_model.status.value),
         )
 
 

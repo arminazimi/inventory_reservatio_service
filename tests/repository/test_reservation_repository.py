@@ -30,6 +30,7 @@ from inventory_reservation.service.reservation import (
     ReservationItem,
     ReservationRepositoryPort,
     ReservationService,
+    ReservationStatus,
 )
 
 FIXED_NOW = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
@@ -419,5 +420,106 @@ async def test_insufficient_inventory_rolls_back_reservation_and_previous_holds(
                         ProductModel.id.in_((available_product_id, unavailable_product_id))
                     )
                 )
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    reservation_id = uuid7()
+    user_id = uuid7()
+
+    try:
+        async with database.session() as session, session.begin():
+            unique_suffix = uuid7().hex
+            product = ProductModel(
+                sku=f"POSTGRES-CONFIRM-{unique_suffix}",
+                name="PostgreSQL confirmation test product",
+            )
+            provider = InventoryProviderModel(
+                name=f"internal-reservation-confirm-{unique_suffix}",
+                kind=ProviderKind.INTERNAL,
+                driver="internal",
+                supports_hold=True,
+                supports_confirm=True,
+            )
+            session.add_all([product, provider])
+            await session.flush()
+            product_id = product.id
+            provider_id = provider.id
+            session.add(
+                InventoryLevelModel(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=5,
+                    reserved=0,
+                )
+            )
+
+        service = ReservationService(
+            transaction_factory=lambda: reservation_transaction(database),
+            clock=FixedClock(),
+            reservation_id_factory=lambda: reservation_id,
+            ttl=timedelta(minutes=15),
+        )
+
+        try:
+            await service.create(
+                user_id=user_id,
+                items=(ReservationItem(product_id=product_id, quantity=2),),
+                idempotency_key="postgres-confirm",
+            )
+            first_confirmation = await service.confirm(
+                reservation_id=reservation_id,
+                user_id=user_id,
+            )
+            repeated_confirmation = await service.confirm(
+                reservation_id=reservation_id,
+                user_id=user_id,
+            )
+
+            async with database.session() as session:
+                inventory = await InventoryRepository(session).get_snapshot(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                )
+
+            assert first_confirmation is not None
+            assert (
+                first_confirmation.status,
+                repeated_confirmation,
+                inventory,
+            ) == (
+                ReservationStatus.CONFIRMED,
+                first_confirmation,
+                InventorySnapshot(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=3,
+                    reserved=0,
+                    version=3,
+                ),
+            )
+        finally:
+            async with database.session() as session, session.begin():
+                await session.execute(
+                    delete(ReservationModel).where(ReservationModel.id == reservation_id)
+                )
+                await session.execute(
+                    delete(InventoryLevelModel).where(
+                        InventoryLevelModel.product_id == product_id,
+                        InventoryLevelModel.provider_id == provider_id,
+                    )
+                )
+                await session.execute(
+                    delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
+                )
+                await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
     finally:
         await database.close()

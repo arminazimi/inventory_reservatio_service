@@ -6,8 +6,10 @@ import pytest
 
 from inventory_reservation.repository.provider import HttpInventoryProvider
 from inventory_reservation.service.provider import (
+    ConfirmCommand,
     HoldCommand,
     ProviderCallFailedError,
+    ProviderConfirmAttempt,
     ProviderHoldAttempt,
 )
 
@@ -129,3 +131,36 @@ async def test_server_error_is_reported_as_provider_call_failure() -> None:
             )
 
     assert captured.value.provider_id == PROVIDER_ID
+
+
+async def test_successful_confirmation_uses_hold_reference_and_idempotency_key() -> None:
+    async def provider_api(request: httpx.Request) -> httpx.Response:
+        assert (
+            request.method,
+            request.url.path,
+            request.headers["Idempotency-Key"],
+            request.content,
+        ) == (
+            "POST",
+            "/holds/external-hold-123/confirm",
+            "reservation:123:allocation:456:confirm",
+            b"",
+        )
+        return httpx.Response(status_code=204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider_api)) as client:
+        provider = HttpInventoryProvider(
+            provider_id=PROVIDER_ID,
+            base_url="https://inventory-provider.example",
+            timeout=2.0,
+            client=client,
+        )
+
+        attempt = await provider.confirm(
+            ConfirmCommand(
+                hold_reference="external-hold-123",
+                idempotency_key="reservation:123:allocation:456:confirm",
+            )
+        )
+
+    assert attempt == ProviderConfirmAttempt.confirmed()

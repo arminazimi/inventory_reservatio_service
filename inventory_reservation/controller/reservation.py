@@ -190,4 +190,25 @@ def create_reservation_router(reservation_service: ReservationService) -> APIRou
             raise ReservationNotFoundError(reservation_id)
         return ReservationResponse.from_domain(reservation)
 
+    @router.post(
+        "/{reservation_id}/confirm",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ErrorResponse,
+                "description": "Reservation does not exist or belongs to another user.",
+            }
+        },
+    )
+    async def confirm_reservation(
+        reservation_id: Annotated[UUID, Path(description="Reservation identifier")],
+        user_id: Annotated[UUID, Header(alias="X-User-ID")],
+    ) -> ReservationResponse:
+        reservation = await reservation_service.confirm(
+            reservation_id=reservation_id,
+            user_id=user_id,
+        )
+        if reservation is None:
+            raise ReservationNotFoundError(reservation_id)
+        return ReservationResponse.from_domain(reservation)
+
     return router
