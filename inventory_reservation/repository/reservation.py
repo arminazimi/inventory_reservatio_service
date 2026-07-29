@@ -1,9 +1,10 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +57,13 @@ class _InventoryConfirmationError(RuntimeError):
 
 class _InventoryReleaseError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseContext:
+    reservation_id: UUID
+    retry_unknown: bool
+    max_attempts: int
 
 
 class SqlAlchemyReservationRepository:
@@ -250,11 +258,78 @@ class SqlAlchemyReservationRepository:
                 expired.append(reservation_domain)
         return tuple(expired)
 
+    async def reconcile_release_batch(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+        max_attempts: int,
+    ) -> tuple[Reservation, ...]:
+        has_reconcilable_operation = (
+            select(ProviderOperationModel.id)
+            .join(
+                InventoryAllocationModel,
+                InventoryAllocationModel.id == ProviderOperationModel.allocation_id,
+            )
+            .join(
+                ReservationItemModel,
+                ReservationItemModel.id == InventoryAllocationModel.reservation_item_id,
+            )
+            .where(
+                ReservationItemModel.reservation_id == ReservationModel.id,
+                ProviderOperationModel.operation == ProviderOperationType.RELEASE,
+                ProviderOperationModel.status == ProviderOperationStatus.UNKNOWN,
+                ProviderOperationModel.attempt_count < max_attempts,
+                or_(
+                    ProviderOperationModel.next_attempt_at.is_(None),
+                    ProviderOperationModel.next_attempt_at <= now,
+                ),
+            )
+            .exists()
+        )
+        statement = (
+            select(ReservationModel)
+            .where(
+                ReservationModel.status == ReservationStatusModel.RELEASING,
+                ReservationModel.release_target_status.in_(
+                    (
+                        ReservationStatusModel.CANCELLED,
+                        ReservationStatusModel.EXPIRED,
+                    )
+                ),
+                has_reconcilable_operation,
+            )
+            .order_by(ReservationModel.updated_at, ReservationModel.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        reservations = (await self._session.scalars(statement)).all()
+        for reservation in reservations:
+            terminal_status = reservation.release_target_status
+            if terminal_status is None:
+                continue
+            await self._release_reservation(
+                reservation,
+                terminal_status=terminal_status,
+                retry_unknown=True,
+                max_attempts=max_attempts,
+            )
+
+        await self._session.flush()
+        reconciled: list[Reservation] = []
+        for reservation in reservations:
+            reservation_domain = await self._to_domain(reservation)
+            if reservation_domain is not None:
+                reconciled.append(reservation_domain)
+        return tuple(reconciled)
+
     async def _release_reservation(
         self,
         reservation: ReservationModel,
         *,
         terminal_status: ReservationStatusModel,
+        retry_unknown: bool = False,
+        max_attempts: int = 1,
     ) -> None:
         allocations_statement = (
             select(
@@ -279,10 +354,16 @@ class SqlAlchemyReservationRepository:
             self._provider_registry,
         )
         release_pending = False
+        release_context = _ReleaseContext(
+            reservation_id=reservation.id,
+            retry_unknown=retry_unknown,
+            max_attempts=max_attempts,
+        )
+        reservation.release_target_status = terminal_status
 
         for allocation, product_id, provider in allocations:
             outcome = await self._release_allocation(
-                reservation_id=reservation.id,
+                context=release_context,
                 allocation=allocation,
                 product_id=product_id,
                 provider=provider,
@@ -297,14 +378,16 @@ class SqlAlchemyReservationRepository:
                 allocation.status = AllocationStatus.HELD
                 release_pending = True
 
-        reservation.status = (
-            ReservationStatusModel.RELEASING if release_pending else terminal_status
-        )
+        if release_pending:
+            reservation.status = ReservationStatusModel.RELEASING
+        else:
+            reservation.status = terminal_status
+            reservation.release_target_status = None
 
     async def _release_allocation(
         self,
         *,
-        reservation_id: UUID,
+        context: _ReleaseContext,
         allocation: InventoryAllocationModel,
         product_id: UUID,
         provider: InventoryProviderModel,
@@ -314,7 +397,7 @@ class SqlAlchemyReservationRepository:
             return ProviderReleaseOutcome.RELEASED
         if provider.kind is ProviderKind.EXTERNAL:
             return await self._release_external_hold(
-                reservation_id=reservation_id,
+                context=context,
                 allocation=allocation,
                 provider=provider,
             )
@@ -331,7 +414,7 @@ class SqlAlchemyReservationRepository:
     async def _release_external_hold(
         self,
         *,
-        reservation_id: UUID,
+        context: _ReleaseContext,
         allocation: InventoryAllocationModel,
         provider: InventoryProviderModel,
     ) -> ProviderReleaseOutcome:
@@ -344,7 +427,7 @@ class SqlAlchemyReservationRepository:
         ):
             raise _InventoryReleaseError
 
-        idempotency_key = f"reservation:{reservation_id}:allocation:{allocation.id}:release"
+        idempotency_key = f"reservation:{context.reservation_id}:allocation:{allocation.id}:release"
         operation_statement = (
             select(ProviderOperationModel)
             .where(ProviderOperationModel.idempotency_key == idempotency_key)
@@ -354,7 +437,9 @@ class SqlAlchemyReservationRepository:
         if operation is not None:
             if operation.status is ProviderOperationStatus.SUCCEEDED:
                 return ProviderReleaseOutcome.RELEASED
-            if operation.status is ProviderOperationStatus.UNKNOWN:
+            if operation.status is ProviderOperationStatus.UNKNOWN and (
+                not context.retry_unknown or operation.attempt_count >= context.max_attempts
+            ):
                 return ProviderReleaseOutcome.UNKNOWN
             operation.status = ProviderOperationStatus.IN_PROGRESS
             operation.attempt_count += 1

@@ -39,7 +39,8 @@ Tests observe behavior through these interfaces:
 
 1. `ReservationService` for create, confirm, cancel, and retrieve behavior;
    `ReservationExpirationWorker` for expiration batching, polling, and graceful
-   shutdown.
+   shutdown; `ReservationReconciliationWorker` for explicitly resolving
+   unknown provider outcomes.
 2. `ProviderRouter` for capability-aware selection, failover, unknown outcomes,
    and circuit-breaker behavior inside the service layer.
 3. The controller HTTP interface for request validation, status codes,

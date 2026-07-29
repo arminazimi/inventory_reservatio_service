@@ -1,6 +1,6 @@
 import os
 from datetime import UTC, datetime, timedelta
-from uuid import uuid7
+from uuid import UUID, uuid7
 
 import httpx
 import pytest
@@ -28,8 +28,10 @@ from inventory_reservation.repository.models import (
 from inventory_reservation.repository.provider import ProviderRegistry
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.reservation import (
+    ReconciliationWorkerConfig,
     ReservationItem,
     ReservationReconciliationRequiredError,
+    ReservationReconciliationWorker,
     ReservationService,
     ReservationStatus,
 )
@@ -40,6 +42,94 @@ FIXED_NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
 class FixedClock:
     def now(self) -> datetime:
         return FIXED_NOW
+
+
+async def load_external_release_state(
+    database: Database,
+    *,
+    reservation_id: UUID,
+) -> tuple[InventoryAllocationModel, ProviderOperationModel]:
+    async with database.session() as session:
+        allocation = (
+            await session.scalars(
+                select(InventoryAllocationModel)
+                .join(
+                    ReservationItemModel,
+                    ReservationItemModel.id == InventoryAllocationModel.reservation_item_id,
+                )
+                .where(ReservationItemModel.reservation_id == reservation_id)
+            )
+        ).one()
+        operation = (
+            await session.scalars(
+                select(ProviderOperationModel).where(
+                    ProviderOperationModel.allocation_id == allocation.id,
+                    ProviderOperationModel.operation == ProviderOperationType.RELEASE,
+                )
+            )
+        ).one()
+        return allocation, operation
+
+
+async def assert_external_release_reconciliation(
+    database: Database,
+    *,
+    provider_registry: ProviderRegistry,
+    service: ReservationService,
+    reservation_id: UUID,
+    requests: list[str],
+) -> None:
+    exhausted_worker = ReservationReconciliationWorker(
+        transaction_factory=lambda: reservation_transaction(
+            database,
+            provider_registry,
+        ),
+        clock=FixedClock(),
+        config=ReconciliationWorkerConfig(
+            batch_size=10,
+            max_attempts=1,
+        ),
+    )
+    assert await exhausted_worker.run_once() == ()
+    assert requests == [
+        "/holds",
+        "/holds/unknown-release-hold/release",
+    ]
+
+    reconciliation_worker = ReservationReconciliationWorker(
+        transaction_factory=lambda: reservation_transaction(
+            database,
+            provider_registry,
+        ),
+        clock=FixedClock(),
+        config=ReconciliationWorkerConfig(
+            batch_size=10,
+            max_attempts=3,
+        ),
+    )
+    reconciled = await reconciliation_worker.run_once()
+    reconciled_reservation = await service.get(reservation_id)
+    reconciled_allocation, reconciled_operation = await load_external_release_state(
+        database,
+        reservation_id=reservation_id,
+    )
+
+    assert [reservation.id for reservation in reconciled] == [reservation_id]
+    assert reconciled_reservation is not None
+    assert reconciled_reservation.status is ReservationStatus.CANCELLED
+    assert reconciled_allocation.status is AllocationStatus.RELEASED
+    assert (
+        reconciled_operation.status,
+        reconciled_operation.attempt_count,
+    ) == (
+        ProviderOperationStatus.SUCCEEDED,
+        2,
+    )
+    assert requests == [
+        "/holds",
+        "/holds/unknown-release-hold/release",
+        "/holds/unknown-release-hold/release",
+    ]
 
 
 @pytest.mark.integration
@@ -572,26 +662,10 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
                     user_id=user_id,
                 )
 
-                async with database.session() as session:
-                    allocation = (
-                        await session.scalars(
-                            select(InventoryAllocationModel)
-                            .join(
-                                ReservationItemModel,
-                                ReservationItemModel.id
-                                == InventoryAllocationModel.reservation_item_id,
-                            )
-                            .where(ReservationItemModel.reservation_id == reservation_id)
-                        )
-                    ).one()
-                    operation = (
-                        await session.scalars(
-                            select(ProviderOperationModel).where(
-                                ProviderOperationModel.allocation_id == allocation.id,
-                                ProviderOperationModel.operation == ProviderOperationType.RELEASE,
-                            )
-                        )
-                    ).one()
+                allocation, operation = await load_external_release_state(
+                    database,
+                    reservation_id=reservation_id,
+                )
 
                 assert first_cancellation is not None
                 assert repeated_cancellation == first_cancellation
@@ -651,18 +725,23 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
     reservation_id = uuid7()
     user_id = uuid7()
     requests: list[str] = []
+    release_attempts = 0
 
     async def external_provider_api(request: httpx.Request) -> httpx.Response:
+        nonlocal release_attempts
         requests.append(request.url.path)
         if request.url.path == "/holds":
             return httpx.Response(
                 status_code=201,
                 json={"hold_reference": "unknown-release-hold"},
             )
-        raise httpx.ReadTimeout(
-            "Provider release timed out",
-            request=request,
-        )
+        release_attempts += 1
+        if release_attempts == 1:
+            raise httpx.ReadTimeout(
+                "Provider release timed out",
+                request=request,
+            )
+        return httpx.Response(status_code=204)
 
     try:
         async with httpx.AsyncClient(
@@ -723,26 +802,10 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
                     user_id=user_id,
                 )
 
-                async with database.session() as session:
-                    allocation = (
-                        await session.scalars(
-                            select(InventoryAllocationModel)
-                            .join(
-                                ReservationItemModel,
-                                ReservationItemModel.id
-                                == InventoryAllocationModel.reservation_item_id,
-                            )
-                            .where(ReservationItemModel.reservation_id == reservation_id)
-                        )
-                    ).one()
-                    operation = (
-                        await session.scalars(
-                            select(ProviderOperationModel).where(
-                                ProviderOperationModel.allocation_id == allocation.id,
-                                ProviderOperationModel.operation == ProviderOperationType.RELEASE,
-                            )
-                        )
-                    ).one()
+                allocation, operation = await load_external_release_state(
+                    database,
+                    reservation_id=reservation_id,
+                )
 
                 assert first_cancellation is not None
                 assert repeated_cancellation == first_cancellation
@@ -760,6 +823,14 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
                     ProviderOperationStatus.UNKNOWN,
                     1,
                     "unknown-release-hold",
+                )
+
+                await assert_external_release_reconciliation(
+                    database,
+                    provider_registry=provider_registry,
+                    service=service,
+                    reservation_id=reservation_id,
+                    requests=requests,
                 )
             finally:
                 async with database.session() as session, session.begin():

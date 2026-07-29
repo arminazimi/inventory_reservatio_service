@@ -277,6 +277,10 @@ class ReservationModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UniqueConstraint("user_id", "idempotency_key"),
         CheckConstraint("length(idempotency_key) > 0", name="idempotency_key_not_empty"),
         CheckConstraint("length(request_fingerprint) = 64", name="request_fingerprint_sha256"),
+        CheckConstraint(
+            "release_target_status IS NULL OR release_target_status IN ('cancelled', 'expired')",
+            name="valid_release_target_status",
+        ),
         CheckConstraint("version >= 1", name="positive_version"),
         Index("ix_reservations_expiry_worker", "status", "expires_at"),
         Index("ix_reservations_user_created", "user_id", "created_at"),
@@ -298,6 +302,16 @@ class ReservationModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         server_default=text("'pending'"),
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    release_target_status: Mapped[ReservationStatus | None] = mapped_column(
+        Enum(
+            ReservationStatus,
+            name="reservation_release_target_status",
+            native_enum=False,
+            create_constraint=False,
+            length=20,
+            values_callable=lambda members: [member.value for member in members],
+        )
+    )
     failure_code: Mapped[str | None] = mapped_column(String(100))
     failure_reason: Mapped[str | None] = mapped_column(Text)
     version: Mapped[int] = mapped_column(

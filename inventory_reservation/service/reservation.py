@@ -170,6 +170,14 @@ class ReservationRepositoryPort(Protocol):
         limit: int,
     ) -> tuple[Reservation, ...]: ...
 
+    async def reconcile_release_batch(
+        self,
+        *,
+        now: datetime,
+        limit: int,
+        max_attempts: int,
+    ) -> tuple[Reservation, ...]: ...
+
     async def get(self, reservation_id: UUID) -> Reservation | None: ...
 
     async def get_by_idempotency_key(
@@ -392,6 +400,39 @@ class ExpirationWorkerRunSummary:
     batches_processed: int
     reservations_processed: int
     batches_failed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationWorkerConfig:
+    batch_size: int
+    max_attempts: int
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ValueError("Reconciliation worker batch size must be positive")
+        if self.max_attempts <= 0:
+            raise ValueError("Reconciliation worker max attempts must be positive")
+
+
+class ReservationReconciliationWorker:
+    def __init__(
+        self,
+        *,
+        transaction_factory: ReservationTransactionFactory,
+        clock: Clock,
+        config: ReconciliationWorkerConfig,
+    ) -> None:
+        self._transaction_factory = transaction_factory
+        self._clock = clock
+        self._config = config
+
+    async def run_once(self) -> tuple[Reservation, ...]:
+        async with self._transaction_factory() as repository:
+            return await repository.reconcile_release_batch(
+                now=self._clock.now(),
+                limit=self._config.batch_size,
+                max_attempts=self._config.max_attempts,
+            )
 
 
 def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:

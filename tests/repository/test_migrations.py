@@ -39,10 +39,17 @@ async def test_latest_migration_creates_the_complete_schema() -> None:
     engine = create_async_engine(database_url)
     try:
         async with engine.connect() as connection:
-            table_names = await connection.run_sync(
-                lambda sync_connection: set(inspect(sync_connection).get_table_names())
+            table_names, reservation_columns = await connection.run_sync(
+                lambda sync_connection: (
+                    set(inspect(sync_connection).get_table_names()),
+                    {
+                        column["name"]
+                        for column in inspect(sync_connection).get_columns("reservations")
+                    },
+                )
             )
     finally:
         await engine.dispose()
 
     assert table_names == EXPECTED_TABLES
+    assert "release_target_status" in reservation_columns
