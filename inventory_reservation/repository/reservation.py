@@ -12,6 +12,8 @@ from inventory_reservation.repository.models import (
     AllocationStatus,
     InventoryAllocationModel,
     InventoryProviderModel,
+    OrderItemModel,
+    OrderModel,
     ProviderKind,
     ProviderOperationModel,
     ProviderOperationStatus,
@@ -116,6 +118,7 @@ class SqlAlchemyReservationRepository:
         if reservation_model is None:
             return None
         if reservation_model.status is ReservationStatusModel.CONFIRMED:
+            await self._ensure_order(reservation_model)
             return await self._to_domain(reservation_model)
 
         allocations_statement = (
@@ -169,8 +172,42 @@ class SqlAlchemyReservationRepository:
             reservation_model.status = ReservationStatusModel.CONFIRMING
         else:
             reservation_model.status = ReservationStatusModel.CONFIRMED
+            await self._ensure_order(reservation_model)
         await self._session.flush()
         return await self._to_domain(reservation_model)
+
+    async def _ensure_order(
+        self,
+        reservation: ReservationModel,
+    ) -> None:
+        existing_order_statement = (
+            select(OrderModel).where(OrderModel.reservation_id == reservation.id).with_for_update()
+        )
+        existing_order = (await self._session.scalars(existing_order_statement)).one_or_none()
+        if existing_order is not None:
+            return
+
+        order = OrderModel(
+            reservation_id=reservation.id,
+            user_id=reservation.user_id,
+        )
+        self._session.add(order)
+        await self._session.flush()
+
+        items_statement = select(ReservationItemModel).where(
+            ReservationItemModel.reservation_id == reservation.id
+        )
+        items = (await self._session.scalars(items_statement)).all()
+        self._session.add_all(
+            [
+                OrderItemModel(
+                    order_id=order.id,
+                    product_id=item.product_id,
+                    quantity=item.requested_quantity,
+                )
+                for item in items
+            ]
+        )
 
     async def _confirm_allocation(
         self,

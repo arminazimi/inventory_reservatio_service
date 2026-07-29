@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid7
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.inventory import (
@@ -16,6 +16,8 @@ from inventory_reservation.repository.inventory import (
 from inventory_reservation.repository.models import (
     InventoryLevelModel,
     InventoryProviderModel,
+    OrderItemModel,
+    OrderModel,
     ProductModel,
     ProviderKind,
     ReservationModel,
@@ -489,6 +491,20 @@ async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
                     product_id=product_id,
                     provider_id=provider_id,
                 )
+                order = (
+                    await session.scalars(
+                        select(OrderModel).where(OrderModel.reservation_id == reservation_id)
+                    )
+                ).one_or_none()
+                order_items = (
+                    []
+                    if order is None
+                    else (
+                        await session.scalars(
+                            select(OrderItemModel).where(OrderItemModel.order_id == order.id)
+                        )
+                    ).all()
+                )
 
             assert first_confirmation is not None
             assert (
@@ -506,8 +522,21 @@ async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
                     version=3,
                 ),
             )
+            assert order is not None
+            assert (
+                order.reservation_id,
+                order.user_id,
+                [(item.product_id, item.quantity) for item in order_items],
+            ) == (
+                reservation_id,
+                user_id,
+                [(product_id, 2)],
+            )
         finally:
             async with database.session() as session, session.begin():
+                await session.execute(
+                    delete(OrderModel).where(OrderModel.reservation_id == reservation_id)
+                )
                 await session.execute(
                     delete(ReservationModel).where(ReservationModel.id == reservation_id)
                 )

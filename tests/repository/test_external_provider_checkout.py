@@ -16,6 +16,7 @@ from inventory_reservation.repository.models import (
     InventoryAllocationModel,
     InventoryLevelModel,
     InventoryProviderModel,
+    OrderModel,
     ProductModel,
     ProviderKind,
     ProviderOperationModel,
@@ -274,6 +275,11 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                             )
                         )
                     ).one()
+                    order = (
+                        await session.scalars(
+                            select(OrderModel).where(OrderModel.reservation_id == reservation_id)
+                        )
+                    ).one_or_none()
 
                 assert first_confirmation is not None
                 assert repeated_confirmation == first_confirmation
@@ -291,6 +297,7 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                     ),
                 ]
                 assert allocation.status is AllocationStatus.CONFIRMED
+                assert order is not None
                 assert (
                     operation.operation,
                     operation.status,
@@ -306,6 +313,9 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                 )
             finally:
                 async with database.session() as session, session.begin():
+                    await session.execute(
+                        delete(OrderModel).where(OrderModel.reservation_id == reservation_id)
+                    )
                     await session.execute(
                         delete(ReservationModel).where(ReservationModel.id == reservation_id)
                     )
@@ -426,6 +436,11 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                             )
                         )
                     ).one()
+                    order = (
+                        await session.scalars(
+                            select(OrderModel).where(OrderModel.reservation_id == reservation_id)
+                        )
+                    ).one_or_none()
 
                 assert first_confirmation is not None
                 assert repeated_confirmation == first_confirmation
@@ -435,6 +450,7 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                     "/holds/unknown-confirm-hold/confirm",
                 ]
                 assert allocation.status is AllocationStatus.UNKNOWN
+                assert order is None
                 assert (
                     operation.status,
                     operation.attempt_count,
