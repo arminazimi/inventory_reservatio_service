@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid7
 
@@ -42,12 +44,20 @@ class FixedClock:
         return FIXED_NOW
 
 
+@asynccontextmanager
+async def in_memory_transaction(
+    repository: InMemoryReservationRepository,
+) -> AsyncIterator[InMemoryReservationRepository]:
+    yield repository
+
+
 async def test_created_reservation_is_retrievable() -> None:
     reservation_id = uuid7()
     user_id = uuid7()
     item = ReservationItem(product_id=PRODUCT_ID, quantity=2)
+    repository = InMemoryReservationRepository()
     service = ReservationService(
-        repository=InMemoryReservationRepository(),
+        transaction_factory=lambda: in_memory_transaction(repository),
         clock=FixedClock(),
         reservation_id_factory=lambda: reservation_id,
         ttl=RESERVATION_TTL,
@@ -76,8 +86,9 @@ async def test_repeated_create_with_same_key_returns_original_reservation() -> N
     reservation_ids = iter((first_reservation_id, next_reservation_id))
     user_id = uuid7()
     item = ReservationItem(product_id=PRODUCT_ID, quantity=2)
+    repository = InMemoryReservationRepository()
     service = ReservationService(
-        repository=InMemoryReservationRepository(),
+        transaction_factory=lambda: in_memory_transaction(repository),
         clock=FixedClock(),
         reservation_id_factory=lambda: next(reservation_ids),
         ttl=RESERVATION_TTL,
@@ -99,8 +110,9 @@ async def test_repeated_create_with_same_key_returns_original_reservation() -> N
 
 async def test_reused_idempotency_key_with_different_payload_is_rejected() -> None:
     user_id = uuid7()
+    repository = InMemoryReservationRepository()
     service = ReservationService(
-        repository=InMemoryReservationRepository(),
+        transaction_factory=lambda: in_memory_transaction(repository),
         clock=FixedClock(),
         reservation_id_factory=uuid7,
         ttl=RESERVATION_TTL,

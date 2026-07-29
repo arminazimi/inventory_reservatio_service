@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -109,16 +110,22 @@ class ReservationRepositoryPort(Protocol):
     ) -> Reservation | None: ...
 
 
+type ReservationTransactionFactory = Callable[
+    [],
+    AbstractAsyncContextManager[ReservationRepositoryPort],
+]
+
+
 class ReservationService:
     def __init__(
         self,
         *,
-        repository: ReservationRepositoryPort,
+        transaction_factory: ReservationTransactionFactory,
         clock: Clock,
         reservation_id_factory: Callable[[], UUID],
         ttl: timedelta,
     ) -> None:
-        self._repository = repository
+        self._transaction_factory = transaction_factory
         self._clock = clock
         self._reservation_id_factory = reservation_id_factory
         self._ttl = ttl
@@ -130,32 +137,34 @@ class ReservationService:
         items: tuple[ReservationItem, ...],
         idempotency_key: str,
     ) -> Reservation:
-        request_fingerprint = _reservation_request_fingerprint(items)
-        existing = await self._repository.get_by_idempotency_key(
-            user_id=user_id,
-            idempotency_key=idempotency_key,
-        )
-        if existing is not None:
-            if existing.request_fingerprint != request_fingerprint:
-                raise IdempotencyConflictError(idempotency_key, existing.id)
-            return existing
-
-        reservation = Reservation.start(
-            ReservationDraft(
-                reservation_id=self._reservation_id_factory(),
+        async with self._transaction_factory() as repository:
+            request_fingerprint = _reservation_request_fingerprint(items)
+            existing = await repository.get_by_idempotency_key(
                 user_id=user_id,
-                items=items,
                 idempotency_key=idempotency_key,
-                request_fingerprint=request_fingerprint,
-                now=self._clock.now(),
-                ttl=self._ttl,
             )
-        )
-        await self._repository.add(reservation)
-        return reservation
+            if existing is not None:
+                if existing.request_fingerprint != request_fingerprint:
+                    raise IdempotencyConflictError(idempotency_key, existing.id)
+                return existing
+
+            reservation = Reservation.start(
+                ReservationDraft(
+                    reservation_id=self._reservation_id_factory(),
+                    user_id=user_id,
+                    items=items,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=request_fingerprint,
+                    now=self._clock.now(),
+                    ttl=self._ttl,
+                )
+            )
+            await repository.add(reservation)
+            return reservation
 
     async def get(self, reservation_id: UUID) -> Reservation | None:
-        return await self._repository.get(reservation_id)
+        async with self._transaction_factory() as repository:
+            return await repository.get(reservation_id)
 
 
 def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:

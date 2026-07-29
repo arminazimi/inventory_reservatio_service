@@ -1,8 +1,11 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.models import (
     ReservationItemModel,
     ReservationModel,
@@ -10,7 +13,11 @@ from inventory_reservation.repository.models import (
 from inventory_reservation.repository.models import (
     ReservationStatus as ReservationStatusModel,
 )
-from inventory_reservation.service.reservation import Reservation, ReservationItem
+from inventory_reservation.service.reservation import (
+    Reservation,
+    ReservationItem,
+    ReservationRepositoryPort,
+)
 
 
 class SqlAlchemyReservationRepository:
@@ -88,3 +95,11 @@ class SqlAlchemyReservationRepository:
             created_at=reservation_model.created_at,
             expires_at=reservation_model.expires_at,
         )
+
+
+@asynccontextmanager
+async def reservation_transaction(
+    database: Database,
+) -> AsyncIterator[ReservationRepositoryPort]:
+    async with database.session() as session, session.begin():
+        yield SqlAlchemyReservationRepository(session)
