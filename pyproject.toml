@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 reservation-expiration-worker = "inventory_reservation.controller.expiration_worker:main"
+reservation-reconciliation-worker = "inventory_reservation.controller.reconciliation_worker:main"
 
 [build-system]
 requires = ["uv_build>=0.11.8,<0.12.0"]

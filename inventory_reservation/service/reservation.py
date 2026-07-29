@@ -176,6 +176,7 @@ class ReservationRepositoryPort(Protocol):
         now: datetime,
         limit: int,
         max_attempts: int,
+        retry_base_delay: timedelta,
     ) -> tuple[Reservation, ...]: ...
 
     async def get(self, reservation_id: UUID) -> Reservation | None: ...
@@ -215,6 +216,32 @@ class ExpirationWorkerObserver(Protocol):
 
 class NullExpirationWorkerObserver:
     def record(self, observation: ExpirationBatchObservation) -> None:
+        pass
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationBatchSucceeded:
+    reservations: tuple[Reservation, ...]
+    duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationBatchFailed:
+    error: Exception
+    duration_seconds: float
+
+
+type ReconciliationBatchObservation = (
+    ReconciliationBatchSucceeded | ReconciliationBatchFailed
+)
+
+
+class ReconciliationWorkerObserver(Protocol):
+    def record(self, observation: ReconciliationBatchObservation) -> None: ...
+
+
+class NullReconciliationWorkerObserver:
+    def record(self, observation: ReconciliationBatchObservation) -> None:
         pass
 
 
@@ -406,12 +433,18 @@ class ExpirationWorkerRunSummary:
 class ReconciliationWorkerConfig:
     batch_size: int
     max_attempts: int
+    poll_interval: timedelta = timedelta(seconds=5)
+    retry_base_delay: timedelta = timedelta(seconds=30)
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0:
             raise ValueError("Reconciliation worker batch size must be positive")
         if self.max_attempts <= 0:
             raise ValueError("Reconciliation worker max attempts must be positive")
+        if self.poll_interval <= timedelta(0):
+            raise ValueError("Reconciliation worker poll interval must be positive")
+        if self.retry_base_delay <= timedelta(0):
+            raise ValueError("Reconciliation worker retry base delay must be positive")
 
 
 class ReservationReconciliationWorker:
@@ -421,10 +454,16 @@ class ReservationReconciliationWorker:
         transaction_factory: ReservationTransactionFactory,
         clock: Clock,
         config: ReconciliationWorkerConfig,
+        observer: ReconciliationWorkerObserver | None = None,
+        monotonic_clock: Callable[[], float] = monotonic,
     ) -> None:
         self._transaction_factory = transaction_factory
         self._clock = clock
         self._config = config
+        self._observer = (
+            observer if observer is not None else NullReconciliationWorkerObserver()
+        )
+        self._monotonic_clock = monotonic_clock
 
     async def run_once(self) -> tuple[Reservation, ...]:
         async with self._transaction_factory() as repository:
@@ -432,7 +471,62 @@ class ReservationReconciliationWorker:
                 now=self._clock.now(),
                 limit=self._config.batch_size,
                 max_attempts=self._config.max_attempts,
+                retry_base_delay=self._config.retry_base_delay,
             )
+
+    async def run(self, stop_event: asyncio.Event) -> ReconciliationWorkerRunSummary:
+        batches_processed = 0
+        reservations_processed = 0
+        batches_failed = 0
+
+        while not stop_event.is_set():
+            started_at = self._monotonic_clock()
+            try:
+                reservations = await self.run_once()
+            except Exception as error:
+                self._observer.record(
+                    ReconciliationBatchFailed(
+                        error=error,
+                        duration_seconds=max(0.0, self._monotonic_clock() - started_at),
+                    )
+                )
+                batches_failed += 1
+                try:
+                    async with asyncio.timeout(self._config.poll_interval.total_seconds()):
+                        await stop_event.wait()
+                except TimeoutError:
+                    pass
+                continue
+
+            self._observer.record(
+                ReconciliationBatchSucceeded(
+                    reservations=reservations,
+                    duration_seconds=max(0.0, self._monotonic_clock() - started_at),
+                )
+            )
+            batches_processed += 1
+            reservations_processed += len(reservations)
+            if len(reservations) == self._config.batch_size:
+                continue
+
+            try:
+                async with asyncio.timeout(self._config.poll_interval.total_seconds()):
+                    await stop_event.wait()
+            except TimeoutError:
+                pass
+
+        return ReconciliationWorkerRunSummary(
+            batches_processed=batches_processed,
+            reservations_processed=reservations_processed,
+            batches_failed=batches_failed,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationWorkerRunSummary:
+    batches_processed: int
+    reservations_processed: int
+    batches_failed: int = 0
 
 
 def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:

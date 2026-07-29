@@ -45,6 +45,11 @@ class FixedClock:
         return FIXED_NOW
 
 
+class FutureClock:
+    def now(self) -> datetime:
+        return FIXED_NOW + timedelta(seconds=31)
+
+
 async def load_external_release_state(
     database: Database,
     *,
@@ -106,9 +111,49 @@ async def assert_external_release_reconciliation(
         config=ReconciliationWorkerConfig(
             batch_size=10,
             max_attempts=3,
+            retry_base_delay=timedelta(seconds=30),
         ),
     )
-    reconciled = await reconciliation_worker.run_once()
+    first_reconciliation = await reconciliation_worker.run_once()
+    pending_reservation = await service.get(reservation_id)
+    pending_allocation, pending_operation = await load_external_release_state(
+        database,
+        reservation_id=reservation_id,
+    )
+
+    assert [reservation.id for reservation in first_reconciliation] == [reservation_id]
+    assert pending_reservation is not None
+    assert pending_reservation.status is ReservationStatus.RELEASING
+    assert pending_allocation.status is AllocationStatus.UNKNOWN
+    assert (
+        pending_operation.status,
+        pending_operation.attempt_count,
+        pending_operation.next_attempt_at,
+    ) == (
+        ProviderOperationStatus.UNKNOWN,
+        2,
+        FIXED_NOW + timedelta(seconds=30),
+    )
+    assert await reconciliation_worker.run_once() == ()
+    assert requests == [
+        "/holds",
+        "/holds/unknown-release-hold/release",
+        "/holds/unknown-release-hold/release",
+    ]
+
+    due_worker = ReservationReconciliationWorker(
+        transaction_factory=lambda: reservation_transaction(
+            database,
+            provider_registry,
+        ),
+        clock=FutureClock(),
+        config=ReconciliationWorkerConfig(
+            batch_size=10,
+            max_attempts=3,
+            retry_base_delay=timedelta(seconds=30),
+        ),
+    )
+    reconciled = await due_worker.run_once()
     reconciled_reservation = await service.get(reservation_id)
     reconciled_allocation, reconciled_operation = await load_external_release_state(
         database,
@@ -124,10 +169,11 @@ async def assert_external_release_reconciliation(
         reconciled_operation.attempt_count,
     ) == (
         ProviderOperationStatus.SUCCEEDED,
-        2,
+        3,
     )
     assert requests == [
         "/holds",
+        "/holds/unknown-release-hold/release",
         "/holds/unknown-release-hold/release",
         "/holds/unknown-release-hold/release",
     ]
@@ -235,9 +281,52 @@ async def assert_external_confirmation_reconciliation(
         config=ReconciliationWorkerConfig(
             batch_size=10,
             max_attempts=3,
+            retry_base_delay=timedelta(seconds=30),
         ),
     )
-    reconciled = await reconciliation_worker.run_once()
+    first_reconciliation = await reconciliation_worker.run_once()
+    pending_reservation = await service.get(reservation_id)
+    pending_allocation, pending_operation, pending_order = (
+        await load_external_confirmation_state(
+            database,
+            reservation_id=reservation_id,
+        )
+    )
+
+    assert [reservation.id for reservation in first_reconciliation] == [reservation_id]
+    assert pending_reservation is not None
+    assert pending_reservation.status is ReservationStatus.CONFIRMING
+    assert pending_allocation.status is AllocationStatus.UNKNOWN
+    assert pending_order is None
+    assert (
+        pending_operation.status,
+        pending_operation.attempt_count,
+        pending_operation.next_attempt_at,
+    ) == (
+        ProviderOperationStatus.UNKNOWN,
+        2,
+        FIXED_NOW + timedelta(seconds=30),
+    )
+    assert await reconciliation_worker.run_once() == ()
+    assert requests == [
+        "/holds",
+        "/holds/unknown-confirm-hold/confirm",
+        "/holds/unknown-confirm-hold/confirm",
+    ]
+
+    due_worker = ReservationReconciliationWorker(
+        transaction_factory=lambda: reservation_transaction(
+            database,
+            provider_registry,
+        ),
+        clock=FutureClock(),
+        config=ReconciliationWorkerConfig(
+            batch_size=10,
+            max_attempts=3,
+            retry_base_delay=timedelta(seconds=30),
+        ),
+    )
+    reconciled = await due_worker.run_once()
     reconciled_reservation = await service.get(reservation_id)
     allocation, operation, order = await load_external_confirmation_state(
         database,
@@ -251,10 +340,11 @@ async def assert_external_confirmation_reconciliation(
     assert order is not None
     assert (operation.status, operation.attempt_count) == (
         ProviderOperationStatus.SUCCEEDED,
-        2,
+        3,
     )
     assert requests == [
         "/holds",
+        "/holds/unknown-confirm-hold/confirm",
         "/holds/unknown-confirm-hold/confirm",
         "/holds/unknown-confirm-hold/confirm",
     ]
@@ -555,7 +645,7 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                 json={"hold_reference": "unknown-confirm-hold"},
             )
         confirmation_attempts += 1
-        if confirmation_attempts == 1:
+        if confirmation_attempts <= 2:
             raise httpx.ReadTimeout(
                 "Provider confirmation timed out",
                 request=request,
@@ -823,7 +913,7 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
                 json={"hold_reference": "unknown-release-hold"},
             )
         release_attempts += 1
-        if release_attempts == 1:
+        if release_attempts <= 2:
             raise httpx.ReadTimeout(
                 "Provider release timed out",
                 request=request,

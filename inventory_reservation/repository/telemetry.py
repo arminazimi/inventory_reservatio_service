@@ -9,6 +9,10 @@ from inventory_reservation.service.reservation import (
     ExpirationBatchObservation,
     ExpirationBatchSucceeded,
     ExpirationWorkerObserver,
+    ReconciliationBatchFailed,
+    ReconciliationBatchObservation,
+    ReconciliationBatchSucceeded,
+    ReconciliationWorkerObserver,
 )
 
 
@@ -75,6 +79,79 @@ class PrometheusExpirationWorkerObserver(ExpirationWorkerObserver):
         self._batch_duration.labels(outcome="failed").observe(observation.duration_seconds)
         self._logger.error(
             "expiration_batch_failed",
+            duration_seconds=observation.duration_seconds,
+            error_type=type(observation.error).__name__,
+            error=str(observation.error),
+        )
+
+
+class PrometheusReconciliationWorkerObserver(ReconciliationWorkerObserver):
+    def __init__(
+        self,
+        *,
+        registry: CollectorRegistry,
+        logger: FilteringBoundLogger | None = None,
+    ) -> None:
+        self._logger = (
+            logger
+            if logger is not None
+            else cast(FilteringBoundLogger, structlog.get_logger("reconciliation_worker"))
+        )
+        self._batches = Counter(
+            "inventory_reservation_reconciliation_batches_total",
+            "Reservation reconciliation batches processed by outcome.",
+            ("outcome",),
+            registry=registry,
+        )
+        self._reservations = Counter(
+            "inventory_reservation_reconciliation_reservations_total",
+            "Reservations processed by the reconciliation worker and resulting status.",
+            ("status",),
+            registry=registry,
+        )
+        self._batch_duration = Histogram(
+            "inventory_reservation_reconciliation_batch_duration_seconds",
+            "Time spent processing one reservation reconciliation batch.",
+            ("outcome",),
+            registry=registry,
+        )
+        self._last_success = Gauge(
+            "inventory_reservation_reconciliation_last_success_unixtime",
+            "Unix timestamp of the last successful reconciliation batch.",
+            registry=registry,
+        )
+
+    def record(self, observation: ReconciliationBatchObservation) -> None:
+        if isinstance(observation, ReconciliationBatchSucceeded):
+            self._record_success(observation)
+            return
+        self._record_failure(observation)
+
+    def _record_success(self, observation: ReconciliationBatchSucceeded) -> None:
+        self._batches.labels(outcome="succeeded").inc()
+        self._batch_duration.labels(outcome="succeeded").observe(
+            observation.duration_seconds
+        )
+        self._last_success.set_to_current_time()
+        status_counts: dict[str, int] = {}
+        for reservation in observation.reservations:
+            status = reservation.status.value
+            self._reservations.labels(status=status).inc()
+            status_counts[status] = status_counts.get(status, 0) + 1
+        self._logger.info(
+            "reconciliation_batch_completed",
+            duration_seconds=observation.duration_seconds,
+            reservations_processed=len(observation.reservations),
+            reservation_statuses=status_counts,
+        )
+
+    def _record_failure(self, observation: ReconciliationBatchFailed) -> None:
+        self._batches.labels(outcome="failed").inc()
+        self._batch_duration.labels(outcome="failed").observe(
+            observation.duration_seconds
+        )
+        self._logger.error(
+            "reconciliation_batch_failed",
             duration_seconds=observation.duration_seconds,
             error_type=type(observation.error).__name__,
             error=str(observation.error),
