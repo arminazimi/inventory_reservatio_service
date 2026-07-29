@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Request, status
+from fastapi import APIRouter, Header, Path, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import JSONResponse
 
@@ -69,6 +69,12 @@ class ErrorResponse(BaseModel):
     error: ErrorDetail
 
 
+class ReservationNotFoundError(LookupError):
+    def __init__(self, reservation_id: UUID) -> None:
+        self.reservation_id = reservation_id
+        super().__init__(f"Reservation {reservation_id} was not found")
+
+
 async def handle_idempotency_conflict(
     _: Request,
     error: Exception,
@@ -85,6 +91,26 @@ async def handle_idempotency_conflict(
     )
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json"),
+    )
+
+
+async def handle_reservation_not_found(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, ReservationNotFoundError):
+        raise error
+
+    response = ErrorResponse(
+        error=ErrorDetail(
+            code="reservation_not_found",
+            message="Reservation was not found.",
+            reservation_id=error.reservation_id,
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
         content=response.model_dump(mode="json"),
     )
 
@@ -121,6 +147,24 @@ def create_reservation_router(reservation_service: ReservationService) -> APIRou
             ),
             idempotency_key=idempotency_key,
         )
+        return ReservationResponse.from_domain(reservation)
+
+    @router.get(
+        "/{reservation_id}",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ErrorResponse,
+                "description": "Reservation does not exist or belongs to another user.",
+            }
+        },
+    )
+    async def get_reservation(
+        reservation_id: Annotated[UUID, Path(description="Reservation identifier")],
+        user_id: Annotated[UUID, Header(alias="X-User-ID")],
+    ) -> ReservationResponse:
+        reservation = await reservation_service.get(reservation_id)
+        if reservation is None or reservation.user_id != user_id:
+            raise ReservationNotFoundError(reservation_id)
         return ReservationResponse.from_domain(reservation)
 
     return router

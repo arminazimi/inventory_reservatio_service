@@ -152,3 +152,104 @@ async def test_reusing_idempotency_key_for_different_request_returns_conflict() 
             "reservation_id": str(reservation_id),
         }
     }
+
+
+async def test_user_can_retrieve_reservation() -> None:
+    reservation_id = uuid7()
+    user_id = uuid7()
+    product_id = uuid7()
+    repository = InMemoryReservationRepository()
+    reservation_service = ReservationService(
+        transaction_factory=lambda: in_memory_transaction(repository),
+        clock=FixedClock(),
+        reservation_id_factory=lambda: reservation_id,
+        ttl=RESERVATION_TTL,
+    )
+    app = create_app(reservation_service=reservation_service)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        await client.post(
+            "/v1/reservations",
+            headers={
+                "X-User-ID": str(user_id),
+                "Idempotency-Key": "checkout-retrieve",
+            },
+            json={
+                "items": [
+                    {
+                        "product_id": str(product_id),
+                        "quantity": 2,
+                    }
+                ]
+            },
+        )
+        response = await client.get(
+            f"/v1/reservations/{reservation_id}",
+            headers={"X-User-ID": str(user_id)},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": str(reservation_id),
+        "user_id": str(user_id),
+        "status": "pending",
+        "items": [
+            {
+                "product_id": str(product_id),
+                "quantity": 2,
+            }
+        ],
+        "created_at": "2026-07-29T12:00:00Z",
+        "expires_at": "2026-07-29T12:15:00Z",
+    }
+
+
+async def test_user_cannot_retrieve_another_users_reservation() -> None:
+    reservation_id = uuid7()
+    owner_id = uuid7()
+    other_user_id = uuid7()
+    product_id = uuid7()
+    repository = InMemoryReservationRepository()
+    reservation_service = ReservationService(
+        transaction_factory=lambda: in_memory_transaction(repository),
+        clock=FixedClock(),
+        reservation_id_factory=lambda: reservation_id,
+        ttl=RESERVATION_TTL,
+    )
+    app = create_app(reservation_service=reservation_service)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        await client.post(
+            "/v1/reservations",
+            headers={
+                "X-User-ID": str(owner_id),
+                "Idempotency-Key": "checkout-private",
+            },
+            json={
+                "items": [
+                    {
+                        "product_id": str(product_id),
+                        "quantity": 2,
+                    }
+                ]
+            },
+        )
+        response = await client.get(
+            f"/v1/reservations/{reservation_id}",
+            headers={"X-User-ID": str(other_user_id)},
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "code": "reservation_not_found",
+            "message": "Reservation was not found.",
+            "reservation_id": str(reservation_id),
+        }
+    }

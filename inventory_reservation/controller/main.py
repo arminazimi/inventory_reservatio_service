@@ -8,8 +8,10 @@ from fastapi import FastAPI
 from starlette.types import Lifespan
 
 from inventory_reservation.controller.reservation import (
+    ReservationNotFoundError,
     create_reservation_router,
     handle_idempotency_conflict,
+    handle_reservation_not_found,
 )
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.reservation import reservation_transaction
@@ -41,6 +43,10 @@ def create_app(
     app.add_exception_handler(
         IdempotencyConflictError,
         handle_idempotency_conflict,
+    )
+    app.add_exception_handler(
+        ReservationNotFoundError,
+        handle_reservation_not_found,
     )
     return app
 
