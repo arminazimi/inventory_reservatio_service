@@ -7,6 +7,7 @@ from uuid import UUID
 class ProviderHoldOutcome(StrEnum):
     HELD = "held"
     OUT_OF_STOCK = "out_of_stock"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +33,10 @@ class ProviderHoldAttempt:
     def out_of_stock(cls) -> ProviderHoldAttempt:
         return cls(outcome=ProviderHoldOutcome.OUT_OF_STOCK)
 
+    @classmethod
+    def unknown(cls) -> ProviderHoldAttempt:
+        return cls(outcome=ProviderHoldOutcome.UNKNOWN)
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderHold:
@@ -44,6 +49,20 @@ class HoldProvider(Protocol):
     def provider_id(self) -> UUID: ...
 
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt: ...
+
+
+class UnknownProviderOutcomeError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        provider_id: UUID,
+        idempotency_key: str,
+    ) -> None:
+        self.provider_id = provider_id
+        self.idempotency_key = idempotency_key
+        super().__init__(
+            f"Provider {provider_id} returned an unknown outcome for operation {idempotency_key!r}"
+        )
 
 
 class ProviderRouter:
@@ -59,6 +78,11 @@ class ProviderRouter:
                 return ProviderHold(
                     provider_id=provider.provider_id,
                     reference=attempt.reference,
+                )
+            if attempt.outcome is ProviderHoldOutcome.UNKNOWN:
+                raise UnknownProviderOutcomeError(
+                    provider_id=provider.provider_id,
+                    idempotency_key=command.idempotency_key,
                 )
 
         return None
