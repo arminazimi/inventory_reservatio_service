@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict
 
 from inventory_reservation.service.provider import (
     HoldCommand,
+    ProviderCallFailedError,
     ProviderHoldAttempt,
 )
 
@@ -47,6 +48,8 @@ class HttpInventoryProvider:
 
         if response.status_code == httpx.codes.CONFLICT:
             return ProviderHoldAttempt.out_of_stock()
+        if response.is_server_error:
+            raise ProviderCallFailedError(self.provider_id)
 
         response.raise_for_status()
         payload = _HoldResponse.model_validate(response.json())

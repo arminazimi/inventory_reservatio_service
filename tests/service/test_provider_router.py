@@ -1,9 +1,12 @@
+import asyncio
 from uuid import UUID
 
 import pytest
 
 from inventory_reservation.service.provider import (
+    CircuitBreakerProvider,
     HoldCommand,
+    ProviderCallFailedError,
     ProviderHold,
     ProviderHoldAttempt,
     ProviderRouter,
@@ -27,6 +30,58 @@ class StubHoldProvider:
 
     async def hold(self, _: HoldCommand) -> ProviderHoldAttempt:
         return self._attempt
+
+
+class RecoveringHoldProvider:
+    def __init__(self, *, provider_id: UUID) -> None:
+        self.provider_id = provider_id
+        self._remaining_failures = 2
+
+    async def hold(self, _: HoldCommand) -> ProviderHoldAttempt:
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            raise ProviderCallFailedError(self.provider_id)
+        return ProviderHoldAttempt.held(reference="recovered-primary-hold")
+
+
+class RecoveringUnknownProvider:
+    def __init__(self, *, provider_id: UUID) -> None:
+        self.provider_id = provider_id
+        self._remaining_unknown_outcomes = 2
+
+    async def hold(self, _: HoldCommand) -> ProviderHoldAttempt:
+        if self._remaining_unknown_outcomes > 0:
+            self._remaining_unknown_outcomes -= 1
+            return ProviderHoldAttempt.unknown()
+        return ProviderHoldAttempt.held(reference="unsafe-primary-hold")
+
+
+class BlockingRecoveryProvider:
+    def __init__(self, *, provider_id: UUID) -> None:
+        self.provider_id = provider_id
+        self._remaining_failures = 2
+        self.probe_started = asyncio.Event()
+        self.release_probe = asyncio.Event()
+
+    async def hold(self, _: HoldCommand) -> ProviderHoldAttempt:
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            raise ProviderCallFailedError(self.provider_id)
+
+        self.probe_started.set()
+        await self.release_probe.wait()
+        return ProviderHoldAttempt.held(reference="half-open-probe-hold")
+
+
+class FakeMonotonicClock:
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 async def test_hold_falls_back_when_preferred_provider_is_out_of_stock() -> None:
@@ -80,3 +135,171 @@ async def test_hold_does_not_fall_back_when_provider_outcome_is_unknown() -> Non
         FIRST_PROVIDER_ID,
         "reservation:789:product:456:hold",
     )
+
+
+async def test_open_circuit_routes_subsequent_holds_to_fallback_provider() -> None:
+    protected_provider = CircuitBreakerProvider(
+        provider=RecoveringHoldProvider(provider_id=FIRST_PROVIDER_ID),
+        failure_threshold=2,
+    )
+    fallback_provider = StubHoldProvider(
+        provider_id=SECOND_PROVIDER_ID,
+        attempt=ProviderHoldAttempt.held(reference="fallback-hold"),
+    )
+    router = ProviderRouter((protected_provider, fallback_provider))
+
+    for attempt_number in (1, 2):
+        await router.hold(
+            HoldCommand(
+                product_id=PRODUCT_ID,
+                quantity=2,
+                idempotency_key=f"reservation:{attempt_number}:product:456:hold",
+            )
+        )
+
+    hold_after_circuit_opens = await router.hold(
+        HoldCommand(
+            product_id=PRODUCT_ID,
+            quantity=2,
+            idempotency_key="reservation:3:product:456:hold",
+        )
+    )
+
+    assert hold_after_circuit_opens == ProviderHold(
+        provider_id=SECOND_PROVIDER_ID,
+        reference="fallback-hold",
+    )
+
+
+async def test_open_circuit_probes_provider_after_recovery_timeout() -> None:
+    clock = FakeMonotonicClock()
+    protected_provider = CircuitBreakerProvider(
+        provider=RecoveringHoldProvider(provider_id=FIRST_PROVIDER_ID),
+        failure_threshold=2,
+        recovery_timeout=30.0,
+        monotonic=clock,
+    )
+    fallback_provider = StubHoldProvider(
+        provider_id=SECOND_PROVIDER_ID,
+        attempt=ProviderHoldAttempt.held(reference="fallback-hold"),
+    )
+    router = ProviderRouter((protected_provider, fallback_provider))
+
+    for attempt_number in (1, 2):
+        await router.hold(
+            HoldCommand(
+                product_id=PRODUCT_ID,
+                quantity=2,
+                idempotency_key=f"reservation:{attempt_number}:product:456:hold",
+            )
+        )
+
+    clock.advance(30.0)
+    recovered_hold = await router.hold(
+        HoldCommand(
+            product_id=PRODUCT_ID,
+            quantity=2,
+            idempotency_key="reservation:3:product:456:hold",
+        )
+    )
+
+    assert recovered_hold == ProviderHold(
+        provider_id=FIRST_PROVIDER_ID,
+        reference="recovered-primary-hold",
+    )
+
+
+async def test_repeated_unknown_outcomes_open_circuit_for_subsequent_holds() -> None:
+    protected_provider = CircuitBreakerProvider(
+        provider=RecoveringUnknownProvider(provider_id=FIRST_PROVIDER_ID),
+        failure_threshold=2,
+    )
+    fallback_provider = StubHoldProvider(
+        provider_id=SECOND_PROVIDER_ID,
+        attempt=ProviderHoldAttempt.held(reference="safe-fallback-hold"),
+    )
+    router = ProviderRouter((protected_provider, fallback_provider))
+
+    for attempt_number in (1, 2):
+        with pytest.raises(UnknownProviderOutcomeError):
+            await router.hold(
+                HoldCommand(
+                    product_id=PRODUCT_ID,
+                    quantity=2,
+                    idempotency_key=f"reservation:{attempt_number}:product:456:hold",
+                )
+            )
+
+    hold_after_circuit_opens = await router.hold(
+        HoldCommand(
+            product_id=PRODUCT_ID,
+            quantity=2,
+            idempotency_key="reservation:3:product:456:hold",
+        )
+    )
+
+    assert hold_after_circuit_opens == ProviderHold(
+        provider_id=SECOND_PROVIDER_ID,
+        reference="safe-fallback-hold",
+    )
+
+
+async def test_half_open_circuit_allows_only_one_concurrent_probe() -> None:
+    clock = FakeMonotonicClock()
+    recovering_provider = BlockingRecoveryProvider(provider_id=FIRST_PROVIDER_ID)
+    protected_provider = CircuitBreakerProvider(
+        provider=recovering_provider,
+        failure_threshold=2,
+        recovery_timeout=30.0,
+        monotonic=clock,
+    )
+    fallback_provider = StubHoldProvider(
+        provider_id=SECOND_PROVIDER_ID,
+        attempt=ProviderHoldAttempt.held(reference="fallback-hold"),
+    )
+    router = ProviderRouter((protected_provider, fallback_provider))
+
+    for attempt_number in (1, 2):
+        await router.hold(
+            HoldCommand(
+                product_id=PRODUCT_ID,
+                quantity=2,
+                idempotency_key=f"reservation:{attempt_number}:product:456:hold",
+            )
+        )
+
+    clock.advance(30.0)
+    first_hold_task = asyncio.create_task(
+        router.hold(
+            HoldCommand(
+                product_id=PRODUCT_ID,
+                quantity=2,
+                idempotency_key="reservation:3:product:456:hold",
+            )
+        )
+    )
+    await recovering_provider.probe_started.wait()
+    second_hold_task = asyncio.create_task(
+        router.hold(
+            HoldCommand(
+                product_id=PRODUCT_ID,
+                quantity=2,
+                idempotency_key="reservation:4:product:456:hold",
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    recovering_provider.release_probe.set()
+
+    holds = await asyncio.gather(first_hold_task, second_hold_task)
+
+    assert set(holds) == {
+        ProviderHold(
+            provider_id=FIRST_PROVIDER_ID,
+            reference="half-open-probe-hold",
+        ),
+        ProviderHold(
+            provider_id=SECOND_PROVIDER_ID,
+            reference="fallback-hold",
+        ),
+    }

@@ -2,9 +2,14 @@ import json
 from uuid import UUID
 
 import httpx
+import pytest
 
 from inventory_reservation.repository.provider import HttpInventoryProvider
-from inventory_reservation.service.provider import HoldCommand, ProviderHoldAttempt
+from inventory_reservation.service.provider import (
+    HoldCommand,
+    ProviderCallFailedError,
+    ProviderHoldAttempt,
+)
 
 PROVIDER_ID = UUID("00000000-0000-7000-8000-000000000001")
 PRODUCT_ID = UUID("00000000-0000-7000-8000-000000000002")
@@ -100,3 +105,27 @@ async def test_timeout_returns_unknown_outcome() -> None:
         )
 
     assert attempt == ProviderHoldAttempt.unknown()
+
+
+async def test_server_error_is_reported_as_provider_call_failure() -> None:
+    async def provider_api(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider_api)) as client:
+        provider = HttpInventoryProvider(
+            provider_id=PROVIDER_ID,
+            base_url="https://inventory-provider.example",
+            timeout=2.0,
+            client=client,
+        )
+
+        with pytest.raises(ProviderCallFailedError) as captured:
+            await provider.hold(
+                HoldCommand(
+                    product_id=PRODUCT_ID,
+                    quantity=2,
+                    idempotency_key="reservation:123:product:456:hold",
+                )
+            )
+
+    assert captured.value.provider_id == PROVIDER_ID

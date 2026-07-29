@@ -1,3 +1,5 @@
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -7,6 +9,7 @@ from uuid import UUID
 class ProviderHoldOutcome(StrEnum):
     HELD = "held"
     OUT_OF_STOCK = "out_of_stock"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     UNKNOWN = "unknown"
 
 
@@ -34,6 +37,10 @@ class ProviderHoldAttempt:
         return cls(outcome=ProviderHoldOutcome.OUT_OF_STOCK)
 
     @classmethod
+    def temporarily_unavailable(cls) -> ProviderHoldAttempt:
+        return cls(outcome=ProviderHoldOutcome.TEMPORARILY_UNAVAILABLE)
+
+    @classmethod
     def unknown(cls) -> ProviderHoldAttempt:
         return cls(outcome=ProviderHoldOutcome.UNKNOWN)
 
@@ -49,6 +56,63 @@ class HoldProvider(Protocol):
     def provider_id(self) -> UUID: ...
 
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt: ...
+
+
+class ProviderCallFailedError(RuntimeError):
+    def __init__(self, provider_id: UUID) -> None:
+        self.provider_id = provider_id
+        super().__init__(f"Provider {provider_id} call failed")
+
+
+class CircuitBreakerProvider:
+    def __init__(
+        self,
+        *,
+        provider: HoldProvider,
+        failure_threshold: int,
+        recovery_timeout: float = 30.0,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.provider_id = provider.provider_id
+        self._provider = provider
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._monotonic = monotonic
+        self._failure_count = 0
+        self._opened_at: float | None = None
+        self._probe_in_flight = False
+
+    async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
+        is_probe = False
+        if self._opened_at is not None:
+            if self._monotonic() - self._opened_at < self._recovery_timeout:
+                return ProviderHoldAttempt.temporarily_unavailable()
+            if self._probe_in_flight:
+                return ProviderHoldAttempt.temporarily_unavailable()
+            self._probe_in_flight = True
+            is_probe = True
+
+        try:
+            try:
+                attempt = await self._provider.hold(command)
+            except ProviderCallFailedError:
+                self._failure_count += 1
+                if self._failure_count >= self._failure_threshold:
+                    self._opened_at = self._monotonic()
+                return ProviderHoldAttempt.temporarily_unavailable()
+
+            if attempt.outcome is ProviderHoldOutcome.UNKNOWN:
+                self._failure_count += 1
+                if self._failure_count >= self._failure_threshold:
+                    self._opened_at = self._monotonic()
+                return attempt
+
+            self._failure_count = 0
+            self._opened_at = None
+            return attempt
+        finally:
+            if is_probe:
+                self._probe_in_flight = False
 
 
 class UnknownProviderOutcomeError(RuntimeError):
