@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from inventory_reservation.repository.models import InventoryLevelModel
@@ -23,6 +23,29 @@ class InventorySnapshot:
 class InventoryRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def get_snapshot(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> InventorySnapshot | None:
+        statement = select(InventoryLevelModel).where(
+            InventoryLevelModel.product_id == product_id,
+            InventoryLevelModel.provider_id == provider_id,
+        )
+        level = (await self._session.scalars(statement)).one_or_none()
+
+        if level is None:
+            return None
+
+        return InventorySnapshot(
+            product_id=level.product_id,
+            provider_id=level.provider_id,
+            on_hand=level.on_hand,
+            reserved=level.reserved,
+            version=level.version,
+        )
 
     async def try_hold(
         self,
