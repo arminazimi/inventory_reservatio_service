@@ -4,11 +4,17 @@ import signal
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import structlog
+from prometheus_client import CollectorRegistry, start_http_server
 
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.provider import ProviderRegistry
 from inventory_reservation.repository.reservation import reservation_transaction
+from inventory_reservation.repository.telemetry import (
+    PrometheusExpirationWorkerObserver,
+)
 from inventory_reservation.service.reservation import (
+    ExpirationWorkerConfig,
     ExpirationWorkerRunSummary,
     ReservationExpirationWorker,
 )
@@ -16,6 +22,8 @@ from inventory_reservation.service.reservation import (
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory"
 DEFAULT_EXPIRATION_BATCH_SIZE = 100
 DEFAULT_EXPIRATION_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_EXPIRATION_METRICS_HOST = "0.0.0.0"
+DEFAULT_EXPIRATION_METRICS_PORT = 9101
 DEFAULT_PROVIDER_FAILURE_THRESHOLD = 3
 DEFAULT_PROVIDER_RECOVERY_TIMEOUT_SECONDS = 30.0
 
@@ -26,51 +34,100 @@ class UtcClock:
 
 
 async def run_expiration_worker() -> ExpirationWorkerRunSummary:
+    structlog.configure(
+        processors=(
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.JSONRenderer(),
+        )
+    )
+    logger = structlog.get_logger("expiration_worker")
     database = Database(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL))
     http_client = httpx.AsyncClient()
-    provider_registry = ProviderRegistry(
-        client=http_client,
-        failure_threshold=int(
+    try:
+        registry = CollectorRegistry()
+        observer = PrometheusExpirationWorkerObserver(registry=registry)
+        metrics_host = os.getenv(
+            "EXPIRATION_METRICS_HOST",
+            DEFAULT_EXPIRATION_METRICS_HOST,
+        )
+        metrics_port = int(
             os.getenv(
-                "PROVIDER_FAILURE_THRESHOLD",
-                str(DEFAULT_PROVIDER_FAILURE_THRESHOLD),
+                "EXPIRATION_METRICS_PORT",
+                str(DEFAULT_EXPIRATION_METRICS_PORT),
             )
-        ),
-        recovery_timeout=float(
-            os.getenv(
-                "PROVIDER_RECOVERY_TIMEOUT_SECONDS",
-                str(DEFAULT_PROVIDER_RECOVERY_TIMEOUT_SECONDS),
-            )
-        ),
-    )
-    worker = ReservationExpirationWorker(
-        transaction_factory=lambda: reservation_transaction(
-            database,
-            provider_registry,
-        ),
-        clock=UtcClock(),
-        batch_size=int(
+        )
+        metrics_server, metrics_thread = start_http_server(
+            metrics_port,
+            addr=metrics_host,
+            registry=registry,
+        )
+        provider_registry = ProviderRegistry(
+            client=http_client,
+            failure_threshold=int(
+                os.getenv(
+                    "PROVIDER_FAILURE_THRESHOLD",
+                    str(DEFAULT_PROVIDER_FAILURE_THRESHOLD),
+                )
+            ),
+            recovery_timeout=float(
+                os.getenv(
+                    "PROVIDER_RECOVERY_TIMEOUT_SECONDS",
+                    str(DEFAULT_PROVIDER_RECOVERY_TIMEOUT_SECONDS),
+                )
+            ),
+        )
+        batch_size = int(
             os.getenv(
                 "EXPIRATION_BATCH_SIZE",
                 str(DEFAULT_EXPIRATION_BATCH_SIZE),
             )
-        ),
-        poll_interval=timedelta(
+        )
+        poll_interval = timedelta(
             seconds=float(
                 os.getenv(
                     "EXPIRATION_POLL_INTERVAL_SECONDS",
                     str(DEFAULT_EXPIRATION_POLL_INTERVAL_SECONDS),
                 )
             )
-        ),
-    )
-    stop_event = asyncio.Event()
-    event_loop = asyncio.get_running_loop()
-    for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
-        event_loop.add_signal_handler(shutdown_signal, stop_event.set)
+        )
+        worker = ReservationExpirationWorker(
+            transaction_factory=lambda: reservation_transaction(
+                database,
+                provider_registry,
+            ),
+            clock=UtcClock(),
+            config=ExpirationWorkerConfig(
+                batch_size=batch_size,
+                poll_interval=poll_interval,
+            ),
+            observer=observer,
+        )
+        stop_event = asyncio.Event()
+        event_loop = asyncio.get_running_loop()
+        for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+            event_loop.add_signal_handler(shutdown_signal, stop_event.set)
 
-    try:
-        return await worker.run(stop_event)
+        logger.info(
+            "expiration_worker_started",
+            batch_size=batch_size,
+            metrics_host=metrics_host,
+            metrics_port=metrics_port,
+            poll_interval_seconds=poll_interval.total_seconds(),
+        )
+        try:
+            summary = await worker.run(stop_event)
+            logger.info(
+                "expiration_worker_stopped",
+                batches_failed=summary.batches_failed,
+                batches_processed=summary.batches_processed,
+                reservations_processed=summary.reservations_processed,
+            )
+            return summary
+        finally:
+            metrics_server.shutdown()
+            metrics_server.server_close()
+            metrics_thread.join()
     finally:
         try:
             await http_client.aclose()

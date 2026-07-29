@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
+from time import monotonic
 from typing import Protocol
 from uuid import UUID
 
@@ -185,6 +186,30 @@ type ReservationTransactionFactory = Callable[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class ExpirationBatchSucceeded:
+    reservations: tuple[Reservation, ...]
+    duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class ExpirationBatchFailed:
+    error: Exception
+    duration_seconds: float
+
+
+type ExpirationBatchObservation = ExpirationBatchSucceeded | ExpirationBatchFailed
+
+
+class ExpirationWorkerObserver(Protocol):
+    def record(self, observation: ExpirationBatchObservation) -> None: ...
+
+
+class NullExpirationWorkerObserver:
+    def record(self, observation: ExpirationBatchObservation) -> None:
+        pass
+
+
 class ReservationService:
     def __init__(
         self,
@@ -279,44 +304,78 @@ class ReservationService:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ExpirationWorkerConfig:
+    batch_size: int
+    poll_interval: timedelta = timedelta(seconds=5)
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0:
+            raise ValueError("Expiration worker batch size must be positive")
+        if self.poll_interval <= timedelta(0):
+            raise ValueError("Expiration worker poll interval must be positive")
+
+
 class ReservationExpirationWorker:
     def __init__(
         self,
         *,
         transaction_factory: ReservationTransactionFactory,
         clock: Clock,
-        batch_size: int,
-        poll_interval: timedelta = timedelta(seconds=5),
+        config: ExpirationWorkerConfig,
+        observer: ExpirationWorkerObserver | None = None,
+        monotonic_clock: Callable[[], float] = monotonic,
     ) -> None:
-        if batch_size <= 0:
-            raise ValueError("Expiration worker batch size must be positive")
-        if poll_interval <= timedelta(0):
-            raise ValueError("Expiration worker poll interval must be positive")
         self._transaction_factory = transaction_factory
         self._clock = clock
-        self._batch_size = batch_size
-        self._poll_interval = poll_interval
+        self._config = config
+        self._observer = observer if observer is not None else NullExpirationWorkerObserver()
+        self._monotonic_clock = monotonic_clock
 
     async def run_once(self) -> tuple[Reservation, ...]:
         async with self._transaction_factory() as repository:
             return await repository.expire_batch(
                 now=self._clock.now(),
-                limit=self._batch_size,
+                limit=self._config.batch_size,
             )
 
     async def run(self, stop_event: asyncio.Event) -> ExpirationWorkerRunSummary:
         batches_processed = 0
         reservations_processed = 0
+        batches_failed = 0
 
         while not stop_event.is_set():
-            reservations = await self.run_once()
+            started_at = self._monotonic_clock()
+            try:
+                reservations = await self.run_once()
+            except Exception as error:
+                self._observer.record(
+                    ExpirationBatchFailed(
+                        error=error,
+                        duration_seconds=max(0.0, self._monotonic_clock() - started_at),
+                    )
+                )
+                batches_failed += 1
+                try:
+                    async with asyncio.timeout(self._config.poll_interval.total_seconds()):
+                        await stop_event.wait()
+                except TimeoutError:
+                    pass
+                continue
+
+            self._observer.record(
+                ExpirationBatchSucceeded(
+                    reservations=reservations,
+                    duration_seconds=max(0.0, self._monotonic_clock() - started_at),
+                )
+            )
             batches_processed += 1
             reservations_processed += len(reservations)
-            if len(reservations) == self._batch_size:
+            if len(reservations) == self._config.batch_size:
                 continue
 
             try:
-                async with asyncio.timeout(self._poll_interval.total_seconds()):
+                async with asyncio.timeout(self._config.poll_interval.total_seconds()):
                     await stop_event.wait()
             except TimeoutError:
                 pass
@@ -324,6 +383,7 @@ class ReservationExpirationWorker:
         return ExpirationWorkerRunSummary(
             batches_processed=batches_processed,
             reservations_processed=reservations_processed,
+            batches_failed=batches_failed,
         )
 
 
@@ -331,6 +391,7 @@ class ReservationExpirationWorker:
 class ExpirationWorkerRunSummary:
     batches_processed: int
     reservations_processed: int
+    batches_failed: int = 0
 
 
 def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:

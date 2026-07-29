@@ -1,0 +1,81 @@
+from typing import cast
+
+import structlog
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+from structlog.typing import FilteringBoundLogger
+
+from inventory_reservation.service.reservation import (
+    ExpirationBatchFailed,
+    ExpirationBatchObservation,
+    ExpirationBatchSucceeded,
+    ExpirationWorkerObserver,
+)
+
+
+class PrometheusExpirationWorkerObserver(ExpirationWorkerObserver):
+    def __init__(
+        self,
+        *,
+        registry: CollectorRegistry,
+        logger: FilteringBoundLogger | None = None,
+    ) -> None:
+        self._logger = (
+            logger
+            if logger is not None
+            else cast(FilteringBoundLogger, structlog.get_logger("expiration_worker"))
+        )
+        self._batches = Counter(
+            "inventory_reservation_expiration_batches_total",
+            "Reservation expiration batches processed by outcome.",
+            ("outcome",),
+            registry=registry,
+        )
+        self._reservations = Counter(
+            "inventory_reservation_expiration_reservations_total",
+            "Reservations processed by the expiration worker and resulting status.",
+            ("status",),
+            registry=registry,
+        )
+        self._batch_duration = Histogram(
+            "inventory_reservation_expiration_batch_duration_seconds",
+            "Time spent processing one reservation expiration batch.",
+            ("outcome",),
+            registry=registry,
+        )
+        self._last_success = Gauge(
+            "inventory_reservation_expiration_last_success_unixtime",
+            "Unix timestamp of the last successful expiration batch.",
+            registry=registry,
+        )
+
+    def record(self, observation: ExpirationBatchObservation) -> None:
+        if isinstance(observation, ExpirationBatchSucceeded):
+            self._record_success(observation)
+            return
+        self._record_failure(observation)
+
+    def _record_success(self, observation: ExpirationBatchSucceeded) -> None:
+        self._batches.labels(outcome="succeeded").inc()
+        self._batch_duration.labels(outcome="succeeded").observe(observation.duration_seconds)
+        self._last_success.set_to_current_time()
+        status_counts: dict[str, int] = {}
+        for reservation in observation.reservations:
+            status = reservation.status.value
+            self._reservations.labels(status=status).inc()
+            status_counts[status] = status_counts.get(status, 0) + 1
+        self._logger.info(
+            "expiration_batch_completed",
+            duration_seconds=observation.duration_seconds,
+            reservations_processed=len(observation.reservations),
+            reservation_statuses=status_counts,
+        )
+
+    def _record_failure(self, observation: ExpirationBatchFailed) -> None:
+        self._batches.labels(outcome="failed").inc()
+        self._batch_duration.labels(outcome="failed").observe(observation.duration_seconds)
+        self._logger.error(
+            "expiration_batch_failed",
+            duration_seconds=observation.duration_seconds,
+            error_type=type(observation.error).__name__,
+            error=str(observation.error),
+        )

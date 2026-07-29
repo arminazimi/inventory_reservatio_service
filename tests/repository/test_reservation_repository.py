@@ -30,6 +30,7 @@ from inventory_reservation.repository.reservation import (
     reservation_transaction,
 )
 from inventory_reservation.service.reservation import (
+    ExpirationWorkerConfig,
     InsufficientInventoryError,
     Reservation,
     ReservationExpirationWorker,
@@ -746,7 +747,7 @@ async def test_expiration_worker_releases_only_expired_reservations() -> None:
         worker = ReservationExpirationWorker(
             transaction_factory=lambda: reservation_transaction(database),
             clock=StaticClock(FIXED_NOW + timedelta(minutes=16)),
-            batch_size=10,
+            config=ExpirationWorkerConfig(batch_size=10),
         )
 
         try:

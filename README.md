@@ -63,7 +63,9 @@ uv run reservation-expiration-worker
 
 The worker handles `SIGINT` and `SIGTERM` gracefully. Its batch size and polling
 interval can be configured with `EXPIRATION_BATCH_SIZE` and
-`EXPIRATION_POLL_INTERVAL_SECONDS`.
+`EXPIRATION_POLL_INTERVAL_SECONDS`. It emits structured JSON logs and exposes
+Prometheus metrics at `http://localhost:9101/metrics`. The metrics address can
+be changed with `EXPIRATION_METRICS_HOST` and `EXPIRATION_METRICS_PORT`.
 
 Stop the local services without deleting database data:
 
