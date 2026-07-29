@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from inventory_reservation.repository.database import Database
@@ -14,10 +15,13 @@ from inventory_reservation.repository.models import (
     ReservationStatus as ReservationStatusModel,
 )
 from inventory_reservation.service.reservation import (
+    ConcurrentReservationCreationError,
     Reservation,
     ReservationItem,
     ReservationRepositoryPort,
 )
+
+IDEMPOTENCY_CONSTRAINT = "uq_reservations_user_id_idempotency_key"
 
 
 class SqlAlchemyReservationRepository:
@@ -101,5 +105,19 @@ class SqlAlchemyReservationRepository:
 async def reservation_transaction(
     database: Database,
 ) -> AsyncIterator[ReservationRepositoryPort]:
-    async with database.session() as session, session.begin():
-        yield SqlAlchemyReservationRepository(session)
+    try:
+        async with database.session() as session, session.begin():
+            yield SqlAlchemyReservationRepository(session)
+    except IntegrityError as error:
+        if _violates_constraint(error, IDEMPOTENCY_CONSTRAINT):
+            raise ConcurrentReservationCreationError from error
+        raise
+
+
+def _violates_constraint(error: IntegrityError, constraint_name: str) -> bool:
+    cause: BaseException | None = error
+    while cause is not None:
+        if getattr(cause, "constraint_name", None) == constraint_name:
+            return True
+        cause = cause.__cause__
+    return False

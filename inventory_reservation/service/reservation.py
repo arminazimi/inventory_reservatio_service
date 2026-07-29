@@ -33,6 +33,10 @@ class IdempotencyConflictError(ValueError):
         )
 
 
+class ConcurrentReservationCreationError(RuntimeError):
+    """Another transaction created the reservation for this idempotency key."""
+
+
 class ReservationStatus(StrEnum):
     PENDING = "pending"
 
@@ -137,30 +141,47 @@ class ReservationService:
         items: tuple[ReservationItem, ...],
         idempotency_key: str,
     ) -> Reservation:
-        async with self._transaction_factory() as repository:
-            request_fingerprint = _reservation_request_fingerprint(items)
-            existing = await repository.get_by_idempotency_key(
-                user_id=user_id,
-                idempotency_key=idempotency_key,
-            )
-            if existing is not None:
-                if existing.request_fingerprint != request_fingerprint:
-                    raise IdempotencyConflictError(idempotency_key, existing.id)
-                return existing
+        request_fingerprint = _reservation_request_fingerprint(items)
 
-            reservation = Reservation.start(
-                ReservationDraft(
-                    reservation_id=self._reservation_id_factory(),
+        try:
+            async with self._transaction_factory() as repository:
+                existing = await repository.get_by_idempotency_key(
                     user_id=user_id,
-                    items=items,
                     idempotency_key=idempotency_key,
-                    request_fingerprint=request_fingerprint,
-                    now=self._clock.now(),
-                    ttl=self._ttl,
                 )
+                if existing is not None:
+                    return _resolve_idempotent_retry(
+                        existing,
+                        idempotency_key=idempotency_key,
+                        request_fingerprint=request_fingerprint,
+                    )
+
+                reservation = Reservation.start(
+                    ReservationDraft(
+                        reservation_id=self._reservation_id_factory(),
+                        user_id=user_id,
+                        items=items,
+                        idempotency_key=idempotency_key,
+                        request_fingerprint=request_fingerprint,
+                        now=self._clock.now(),
+                        ttl=self._ttl,
+                    )
+                )
+                await repository.add(reservation)
+                return reservation
+        except ConcurrentReservationCreationError:
+            async with self._transaction_factory() as repository:
+                existing = await repository.get_by_idempotency_key(
+                    user_id=user_id,
+                    idempotency_key=idempotency_key,
+                )
+            if existing is None:
+                raise
+            return _resolve_idempotent_retry(
+                existing,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
             )
-            await repository.add(reservation)
-            return reservation
 
     async def get(self, reservation_id: UUID) -> Reservation | None:
         async with self._transaction_factory() as repository:
@@ -173,3 +194,14 @@ def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:
         for item in sorted(items, key=lambda item: item.product_id.int)
     )
     return sha256(canonical_items.encode()).hexdigest()
+
+
+def _resolve_idempotent_retry(
+    existing: Reservation,
+    *,
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> Reservation:
+    if existing.request_fingerprint != request_fingerprint:
+        raise IdempotencyConflictError(idempotency_key, existing.id)
+    return existing
