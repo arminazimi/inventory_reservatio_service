@@ -17,6 +17,17 @@ dependencies = [
     "uvicorn>=0.52.0",
 ]
 
+[project.scripts]
+reservation-expiration-worker = "inventory_reservation.controller.expiration_worker:main"
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "inventory_reservation"
+module-root = ""
+
 [project.optional-dependencies]
 dev = [
     "mypy>=1.18,<2",

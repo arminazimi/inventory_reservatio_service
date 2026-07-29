@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
@@ -285,10 +286,16 @@ class ReservationExpirationWorker:
         transaction_factory: ReservationTransactionFactory,
         clock: Clock,
         batch_size: int,
+        poll_interval: timedelta = timedelta(seconds=5),
     ) -> None:
+        if batch_size <= 0:
+            raise ValueError("Expiration worker batch size must be positive")
+        if poll_interval <= timedelta(0):
+            raise ValueError("Expiration worker poll interval must be positive")
         self._transaction_factory = transaction_factory
         self._clock = clock
         self._batch_size = batch_size
+        self._poll_interval = poll_interval
 
     async def run_once(self) -> tuple[Reservation, ...]:
         async with self._transaction_factory() as repository:
@@ -296,6 +303,34 @@ class ReservationExpirationWorker:
                 now=self._clock.now(),
                 limit=self._batch_size,
             )
+
+    async def run(self, stop_event: asyncio.Event) -> ExpirationWorkerRunSummary:
+        batches_processed = 0
+        reservations_processed = 0
+
+        while not stop_event.is_set():
+            reservations = await self.run_once()
+            batches_processed += 1
+            reservations_processed += len(reservations)
+            if len(reservations) == self._batch_size:
+                continue
+
+            try:
+                async with asyncio.timeout(self._poll_interval.total_seconds()):
+                    await stop_event.wait()
+            except TimeoutError:
+                pass
+
+        return ExpirationWorkerRunSummary(
+            batches_processed=batches_processed,
+            reservations_processed=reservations_processed,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExpirationWorkerRunSummary:
+    batches_processed: int
+    reservations_processed: int
 
 
 def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:

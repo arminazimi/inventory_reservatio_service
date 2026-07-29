@@ -55,6 +55,16 @@ Verify that SQLAlchemy metadata and migrations have not drifted:
 uv run alembic check
 ```
 
+Run the reservation expiration worker in a separate process:
+
+```bash
+uv run reservation-expiration-worker
+```
+
+The worker handles `SIGINT` and `SIGTERM` gracefully. Its batch size and polling
+interval can be configured with `EXPIRATION_BATCH_SIZE` and
+`EXPIRATION_POLL_INTERVAL_SECONDS`.
+
 Stop the local services without deleting database data:
 
 ```bash
