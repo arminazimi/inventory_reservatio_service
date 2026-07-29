@@ -1,0 +1,4 @@
+Single-database Alembic migration environment for the Inventory Reservation
+Service. Generate revisions from SQLAlchemy metadata and review every generated
+operation before applying it.
+

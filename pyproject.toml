@@ -38,6 +38,10 @@ addopts = [
     "--showlocals",
 ]
 asyncio_mode = "auto"
+markers = [
+    "integration: requires a real infrastructure dependency",
+]
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.coverage.run]

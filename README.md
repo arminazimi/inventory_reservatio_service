@@ -29,6 +29,38 @@ For pip-based environments:
 python -m pip install -r requirements-dev.txt
 ```
 
+## Local PostgreSQL
+
+Start PostgreSQL and wait for its healthcheck:
+
+```bash
+docker compose up -d --wait postgres
+```
+
+Run the database connectivity test:
+
+```bash
+uv run pytest tests/repository/test_database.py
+```
+
+Apply the latest database schema:
+
+```bash
+uv run alembic upgrade head
+```
+
+Verify that SQLAlchemy metadata and migrations have not drifted:
+
+```bash
+uv run alembic check
+```
+
+Stop the local services without deleting database data:
+
+```bash
+docker compose down
+```
+
 ## Architecture
 
 The service uses a direct three-layer request flow:
@@ -44,3 +76,6 @@ Dependencies flow from `controller` to `service` to `repository`. See
 [`CONTEXT.md`](CONTEXT.md) for the ubiquitous language and test seams, and
 [`docs/adr/0001-three-layer-architecture.md`](docs/adr/0001-three-layer-architecture.md)
 for the architectural decision.
+
+The tables, constraints, and operational indexes are described in
+[`docs/database-schema.md`](docs/database-schema.md).
