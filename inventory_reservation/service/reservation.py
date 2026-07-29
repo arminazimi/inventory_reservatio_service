@@ -37,10 +37,23 @@ class ConcurrentReservationCreationError(RuntimeError):
     """Another transaction created the reservation for this idempotency key."""
 
 
+class ReservationNotCancellableError(RuntimeError):
+    def __init__(self, reservation_id: UUID) -> None:
+        self.reservation_id = reservation_id
+        super().__init__(f"Confirmed reservation {reservation_id} cannot be cancelled")
+
+
+class ReservationNotConfirmableError(RuntimeError):
+    def __init__(self, reservation_id: UUID) -> None:
+        self.reservation_id = reservation_id
+        super().__init__(f"Cancelled reservation {reservation_id} cannot be confirmed")
+
+
 class ReservationStatus(StrEnum):
     PENDING = "pending"
     CONFIRMING = "confirming"
     CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"
     FAILED = "failed"
 
 
@@ -105,7 +118,16 @@ class Reservation:
     def confirm(self) -> Reservation:
         if self.status is ReservationStatus.CONFIRMED:
             return self
+        if self.status is ReservationStatus.CANCELLED:
+            raise ReservationNotConfirmableError(self.id)
         return replace(self, status=ReservationStatus.CONFIRMED)
+
+    def cancel(self) -> Reservation:
+        if self.status is ReservationStatus.CANCELLED:
+            return self
+        if self.status is ReservationStatus.CONFIRMED:
+            raise ReservationNotCancellableError(self.id)
+        return replace(self, status=ReservationStatus.CANCELLED)
 
 
 class Clock(Protocol):
@@ -116,6 +138,13 @@ class ReservationRepositoryPort(Protocol):
     async def add_with_hold(self, reservation: Reservation) -> bool: ...
 
     async def confirm(
+        self,
+        *,
+        reservation_id: UUID,
+        user_id: UUID,
+    ) -> Reservation | None: ...
+
+    async def cancel(
         self,
         *,
         reservation_id: UUID,
@@ -215,6 +244,18 @@ class ReservationService:
     ) -> Reservation | None:
         async with self._transaction_factory() as repository:
             return await repository.confirm(
+                reservation_id=reservation_id,
+                user_id=user_id,
+            )
+
+    async def cancel(
+        self,
+        *,
+        reservation_id: UUID,
+        user_id: UUID,
+    ) -> Reservation | None:
+        async with self._transaction_factory() as repository:
+            return await repository.cancel(
                 reservation_id=reservation_id,
                 user_id=user_id,
             )

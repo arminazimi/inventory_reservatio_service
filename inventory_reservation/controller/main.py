@@ -13,6 +13,8 @@ from inventory_reservation.controller.reservation import (
     create_reservation_router,
     handle_idempotency_conflict,
     handle_insufficient_inventory,
+    handle_reservation_not_cancellable,
+    handle_reservation_not_confirmable,
     handle_reservation_not_found,
 )
 from inventory_reservation.repository.database import Database
@@ -21,6 +23,8 @@ from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.reservation import (
     IdempotencyConflictError,
     InsufficientInventoryError,
+    ReservationNotCancellableError,
+    ReservationNotConfirmableError,
     ReservationService,
 )
 
@@ -57,6 +61,14 @@ def create_app(
     app.add_exception_handler(
         ReservationNotFoundError,
         handle_reservation_not_found,
+    )
+    app.add_exception_handler(
+        ReservationNotCancellableError,
+        handle_reservation_not_cancellable,
+    )
+    app.add_exception_handler(
+        ReservationNotConfirmableError,
+        handle_reservation_not_confirmable,
     )
     return app
 

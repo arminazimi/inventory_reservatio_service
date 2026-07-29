@@ -14,12 +14,15 @@ from inventory_reservation.repository.inventory import (
     InventorySnapshot,
 )
 from inventory_reservation.repository.models import (
+    AllocationStatus,
+    InventoryAllocationModel,
     InventoryLevelModel,
     InventoryProviderModel,
     OrderItemModel,
     OrderModel,
     ProductModel,
     ProviderKind,
+    ReservationItemModel,
     ReservationModel,
 )
 from inventory_reservation.repository.reservation import (
@@ -30,6 +33,8 @@ from inventory_reservation.service.reservation import (
     InsufficientInventoryError,
     Reservation,
     ReservationItem,
+    ReservationNotCancellableError,
+    ReservationNotConfirmableError,
     ReservationRepositoryPort,
     ReservationService,
     ReservationStatus,
@@ -485,6 +490,11 @@ async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
                 reservation_id=reservation_id,
                 user_id=user_id,
             )
+            with pytest.raises(ReservationNotCancellableError):
+                await service.cancel(
+                    reservation_id=reservation_id,
+                    user_id=user_id,
+                )
 
             async with database.session() as session:
                 inventory = await InventoryRepository(session).get_snapshot(
@@ -537,6 +547,124 @@ async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
                 await session.execute(
                     delete(OrderModel).where(OrderModel.reservation_id == reservation_id)
                 )
+                await session.execute(
+                    delete(ReservationModel).where(ReservationModel.id == reservation_id)
+                )
+                await session.execute(
+                    delete(InventoryLevelModel).where(
+                        InventoryLevelModel.product_id == product_id,
+                        InventoryLevelModel.provider_id == provider_id,
+                    )
+                )
+                await session.execute(
+                    delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
+                )
+                await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_cancelled_reservation_releases_internal_hold_once() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    reservation_id = uuid7()
+    user_id = uuid7()
+
+    try:
+        async with database.session() as session, session.begin():
+            unique_suffix = uuid7().hex
+            product = ProductModel(
+                sku=f"POSTGRES-CANCEL-{unique_suffix}",
+                name="PostgreSQL cancellation test product",
+            )
+            provider = InventoryProviderModel(
+                name=f"internal-reservation-cancel-{unique_suffix}",
+                kind=ProviderKind.INTERNAL,
+                driver="internal",
+                supports_hold=True,
+                supports_release=True,
+            )
+            session.add_all([product, provider])
+            await session.flush()
+            product_id = product.id
+            provider_id = provider.id
+            session.add(
+                InventoryLevelModel(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=5,
+                    reserved=0,
+                )
+            )
+
+        service = ReservationService(
+            transaction_factory=lambda: reservation_transaction(database),
+            clock=FixedClock(),
+            reservation_id_factory=lambda: reservation_id,
+            ttl=timedelta(minutes=15),
+        )
+
+        try:
+            await service.create(
+                user_id=user_id,
+                items=(ReservationItem(product_id=product_id, quantity=2),),
+                idempotency_key="postgres-cancel",
+            )
+            first_cancellation = await service.cancel(
+                reservation_id=reservation_id,
+                user_id=user_id,
+            )
+            repeated_cancellation = await service.cancel(
+                reservation_id=reservation_id,
+                user_id=user_id,
+            )
+            with pytest.raises(ReservationNotConfirmableError):
+                await service.confirm(
+                    reservation_id=reservation_id,
+                    user_id=user_id,
+                )
+
+            async with database.session() as session:
+                inventory = await InventoryRepository(session).get_snapshot(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                )
+                allocation = (
+                    await session.scalars(
+                        select(InventoryAllocationModel)
+                        .join(
+                            ReservationItemModel,
+                            ReservationItemModel.id == InventoryAllocationModel.reservation_item_id,
+                        )
+                        .where(ReservationItemModel.reservation_id == reservation_id)
+                    )
+                ).one()
+
+            assert first_cancellation is not None
+            assert (
+                first_cancellation.status,
+                repeated_cancellation,
+                allocation.status,
+                inventory,
+            ) == (
+                ReservationStatus.CANCELLED,
+                first_cancellation,
+                AllocationStatus.RELEASED,
+                InventorySnapshot(
+                    product_id=product_id,
+                    provider_id=provider_id,
+                    on_hand=5,
+                    reserved=0,
+                    version=3,
+                ),
+            )
+        finally:
+            async with database.session() as session, session.begin():
                 await session.execute(
                     delete(ReservationModel).where(ReservationModel.id == reservation_id)
                 )

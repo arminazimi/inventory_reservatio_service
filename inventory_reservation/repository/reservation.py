@@ -33,6 +33,8 @@ from inventory_reservation.service.reservation import (
     ConcurrentReservationCreationError,
     Reservation,
     ReservationItem,
+    ReservationNotCancellableError,
+    ReservationNotConfirmableError,
     ReservationRepositoryPort,
     ReservationStatus,
 )
@@ -45,6 +47,10 @@ class _InsufficientInventoryError(RuntimeError):
 
 
 class _InventoryConfirmationError(RuntimeError):
+    pass
+
+
+class _InventoryReleaseError(RuntimeError):
     pass
 
 
@@ -120,6 +126,8 @@ class SqlAlchemyReservationRepository:
         if reservation_model.status is ReservationStatusModel.CONFIRMED:
             await self._ensure_order(reservation_model)
             return await self._to_domain(reservation_model)
+        if reservation_model.status is ReservationStatusModel.CANCELLED:
+            raise ReservationNotConfirmableError(reservation_id)
 
         allocations_statement = (
             select(
@@ -173,6 +181,69 @@ class SqlAlchemyReservationRepository:
         else:
             reservation_model.status = ReservationStatusModel.CONFIRMED
             await self._ensure_order(reservation_model)
+        await self._session.flush()
+        return await self._to_domain(reservation_model)
+
+    async def cancel(
+        self,
+        *,
+        reservation_id: UUID,
+        user_id: UUID,
+    ) -> Reservation | None:
+        reservation_statement = (
+            select(ReservationModel)
+            .where(
+                ReservationModel.id == reservation_id,
+                ReservationModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        reservation_model = (await self._session.scalars(reservation_statement)).one_or_none()
+        if reservation_model is None:
+            return None
+        if reservation_model.status is ReservationStatusModel.CANCELLED:
+            return await self._to_domain(reservation_model)
+        if reservation_model.status is ReservationStatusModel.CONFIRMED:
+            raise ReservationNotCancellableError(reservation_id)
+
+        allocations_statement = (
+            select(
+                InventoryAllocationModel,
+                ReservationItemModel.product_id,
+                InventoryProviderModel.kind,
+            )
+            .join(
+                ReservationItemModel,
+                ReservationItemModel.id == InventoryAllocationModel.reservation_item_id,
+            )
+            .join(
+                InventoryProviderModel,
+                InventoryProviderModel.id == InventoryAllocationModel.provider_id,
+            )
+            .where(ReservationItemModel.reservation_id == reservation_id)
+            .with_for_update()
+        )
+        allocations = (await self._session.execute(allocations_statement)).all()
+        inventory_repository = InventoryRepository(
+            self._session,
+            self._provider_registry,
+        )
+
+        for allocation, product_id, provider_kind in allocations:
+            if allocation.status is AllocationStatus.RELEASED:
+                continue
+            if provider_kind is not ProviderKind.INTERNAL:
+                raise _InventoryReleaseError
+            released_inventory = await inventory_repository.release_hold(
+                product_id=product_id,
+                provider_id=allocation.provider_id,
+                quantity=allocation.quantity,
+            )
+            if released_inventory is None:
+                raise _InventoryReleaseError
+            allocation.status = AllocationStatus.RELEASED
+
+        reservation_model.status = ReservationStatusModel.CANCELLED
         await self._session.flush()
         return await self._to_domain(reservation_model)
 

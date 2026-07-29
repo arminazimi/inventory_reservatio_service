@@ -11,6 +11,8 @@ from inventory_reservation.service.reservation import (
     InsufficientInventoryError,
     Reservation,
     ReservationItem,
+    ReservationNotCancellableError,
+    ReservationNotConfirmableError,
     ReservationService,
     ReservationStatus,
 )
@@ -135,6 +137,46 @@ async def handle_reservation_not_found(
     )
 
 
+async def handle_reservation_not_cancellable(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, ReservationNotCancellableError):
+        raise error
+
+    response = ErrorResponse(
+        error=ErrorDetail(
+            code="reservation_not_cancellable",
+            message="Confirmed reservation cannot be cancelled.",
+            reservation_id=error.reservation_id,
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json", exclude_none=True),
+    )
+
+
+async def handle_reservation_not_confirmable(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, ReservationNotConfirmableError):
+        raise error
+
+    response = ErrorResponse(
+        error=ErrorDetail(
+            code="reservation_not_confirmable",
+            message="Cancelled reservation cannot be confirmed.",
+            reservation_id=error.reservation_id,
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json", exclude_none=True),
+    )
+
+
 def create_reservation_router(reservation_service: ReservationService) -> APIRouter:
     router = APIRouter(prefix="/v1/reservations", tags=["reservations"])
 
@@ -196,7 +238,11 @@ def create_reservation_router(reservation_service: ReservationService) -> APIRou
             status.HTTP_404_NOT_FOUND: {
                 "model": ErrorResponse,
                 "description": "Reservation does not exist or belongs to another user.",
-            }
+            },
+            status.HTTP_409_CONFLICT: {
+                "model": ErrorResponse,
+                "description": "Cancelled reservation cannot be confirmed.",
+            },
         },
     )
     async def confirm_reservation(
@@ -204,6 +250,31 @@ def create_reservation_router(reservation_service: ReservationService) -> APIRou
         user_id: Annotated[UUID, Header(alias="X-User-ID")],
     ) -> ReservationResponse:
         reservation = await reservation_service.confirm(
+            reservation_id=reservation_id,
+            user_id=user_id,
+        )
+        if reservation is None:
+            raise ReservationNotFoundError(reservation_id)
+        return ReservationResponse.from_domain(reservation)
+
+    @router.post(
+        "/{reservation_id}/cancel",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ErrorResponse,
+                "description": "Reservation does not exist or belongs to another user.",
+            },
+            status.HTTP_409_CONFLICT: {
+                "model": ErrorResponse,
+                "description": "Confirmed reservation cannot be cancelled.",
+            },
+        },
+    )
+    async def cancel_reservation(
+        reservation_id: Annotated[UUID, Path(description="Reservation identifier")],
+        user_id: Annotated[UUID, Header(alias="X-User-ID")],
+    ) -> ReservationResponse:
+        reservation = await reservation_service.cancel(
             reservation_id=reservation_id,
             user_id=user_id,
         )

@@ -50,6 +50,21 @@ class InMemoryReservationRepository:
         self._reservations_by_key[(confirmed.user_id, confirmed.idempotency_key)] = confirmed
         return confirmed
 
+    async def cancel(
+        self,
+        *,
+        reservation_id: UUID,
+        user_id: UUID,
+    ) -> Reservation | None:
+        reservation = self._reservations_by_id.get(reservation_id)
+        if reservation is None or reservation.user_id != user_id:
+            return None
+
+        cancelled = reservation.cancel()
+        self._reservations_by_id[reservation_id] = cancelled
+        self._reservations_by_key[(cancelled.user_id, cancelled.idempotency_key)] = cancelled
+        return cancelled
+
     async def get_by_idempotency_key(
         self,
         *,
@@ -336,6 +351,178 @@ async def test_user_can_idempotently_confirm_reservation() -> None:
         200,
         expected_response,
     )
+
+
+async def test_user_can_idempotently_cancel_pending_reservation() -> None:
+    reservation_id = uuid7()
+    user_id = uuid7()
+    product_id = uuid7()
+    repository = InMemoryReservationRepository()
+    reservation_service = ReservationService(
+        transaction_factory=lambda: in_memory_transaction(repository),
+        clock=FixedClock(),
+        reservation_id_factory=lambda: reservation_id,
+        ttl=RESERVATION_TTL,
+    )
+    app = create_app(reservation_service=reservation_service)
+    headers = {"X-User-ID": str(user_id)}
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        await client.post(
+            "/v1/reservations",
+            headers={
+                **headers,
+                "Idempotency-Key": "checkout-cancel",
+            },
+            json={
+                "items": [
+                    {
+                        "product_id": str(product_id),
+                        "quantity": 2,
+                    }
+                ]
+            },
+        )
+        first_cancellation = await client.post(
+            f"/v1/reservations/{reservation_id}/cancel",
+            headers=headers,
+        )
+        repeated_cancellation = await client.post(
+            f"/v1/reservations/{reservation_id}/cancel",
+            headers=headers,
+        )
+
+    expected_response = {
+        "id": str(reservation_id),
+        "user_id": str(user_id),
+        "status": "cancelled",
+        "items": [
+            {
+                "product_id": str(product_id),
+                "quantity": 2,
+            }
+        ],
+        "created_at": "2026-07-29T12:00:00Z",
+        "expires_at": "2026-07-29T12:15:00Z",
+    }
+    assert (
+        first_cancellation.status_code,
+        first_cancellation.json(),
+        repeated_cancellation.status_code,
+        repeated_cancellation.json(),
+    ) == (
+        200,
+        expected_response,
+        200,
+        expected_response,
+    )
+
+
+async def test_confirmed_reservation_cannot_be_cancelled() -> None:
+    reservation_id = uuid7()
+    user_id = uuid7()
+    product_id = uuid7()
+    repository = InMemoryReservationRepository()
+    reservation_service = ReservationService(
+        transaction_factory=lambda: in_memory_transaction(repository),
+        clock=FixedClock(),
+        reservation_id_factory=lambda: reservation_id,
+        ttl=RESERVATION_TTL,
+    )
+    app = create_app(reservation_service=reservation_service)
+    headers = {"X-User-ID": str(user_id)}
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        await client.post(
+            "/v1/reservations",
+            headers={
+                **headers,
+                "Idempotency-Key": "checkout-confirmed-cancel",
+            },
+            json={
+                "items": [
+                    {
+                        "product_id": str(product_id),
+                        "quantity": 2,
+                    }
+                ]
+            },
+        )
+        await client.post(
+            f"/v1/reservations/{reservation_id}/confirm",
+            headers=headers,
+        )
+        cancellation = await client.post(
+            f"/v1/reservations/{reservation_id}/cancel",
+            headers=headers,
+        )
+
+    assert cancellation.status_code == 409
+    assert cancellation.json() == {
+        "error": {
+            "code": "reservation_not_cancellable",
+            "message": "Confirmed reservation cannot be cancelled.",
+            "reservation_id": str(reservation_id),
+        }
+    }
+
+
+async def test_cancelled_reservation_cannot_be_confirmed() -> None:
+    reservation_id = uuid7()
+    user_id = uuid7()
+    product_id = uuid7()
+    repository = InMemoryReservationRepository()
+    reservation_service = ReservationService(
+        transaction_factory=lambda: in_memory_transaction(repository),
+        clock=FixedClock(),
+        reservation_id_factory=lambda: reservation_id,
+        ttl=RESERVATION_TTL,
+    )
+    app = create_app(reservation_service=reservation_service)
+    headers = {"X-User-ID": str(user_id)}
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        await client.post(
+            "/v1/reservations",
+            headers={
+                **headers,
+                "Idempotency-Key": "checkout-cancelled-confirm",
+            },
+            json={
+                "items": [
+                    {
+                        "product_id": str(product_id),
+                        "quantity": 2,
+                    }
+                ]
+            },
+        )
+        await client.post(
+            f"/v1/reservations/{reservation_id}/cancel",
+            headers=headers,
+        )
+        confirmation = await client.post(
+            f"/v1/reservations/{reservation_id}/confirm",
+            headers=headers,
+        )
+
+    assert confirmation.status_code == 409
+    assert confirmation.json() == {
+        "error": {
+            "code": "reservation_not_confirmable",
+            "message": "Cancelled reservation cannot be confirmed.",
+            "reservation_id": str(reservation_id),
+        }
+    }
 
 
 async def test_user_cannot_retrieve_another_users_reservation() -> None:
