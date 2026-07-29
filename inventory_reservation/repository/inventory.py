@@ -9,6 +9,12 @@ from inventory_reservation.repository.models import (
     InventoryProviderModel,
     ProviderKind,
 )
+from inventory_reservation.service.provider import (
+    HoldCommand,
+    ProviderHold,
+    ProviderHoldAttempt,
+    ProviderRouter,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +95,8 @@ class InventoryRepository:
         *,
         product_id: UUID,
         quantity: int,
-    ) -> InventorySnapshot | None:
+        idempotency_key: str,
+    ) -> ProviderHold | None:
         candidates_statement = (
             select(InventoryLevelModel.provider_id)
             .join(
@@ -109,13 +116,35 @@ class InventoryRepository:
         )
         provider_ids = (await self._session.scalars(candidates_statement)).all()
 
-        for provider_id in provider_ids:
-            snapshot = await self.try_hold(
-                product_id=product_id,
-                provider_id=provider_id,
-                quantity=quantity,
+        router = ProviderRouter(
+            tuple(
+                _InternalInventoryProvider(
+                    provider_id=provider_id,
+                    inventory_repository=self,
+                )
+                for provider_id in provider_ids
             )
-            if snapshot is not None:
-                return snapshot
+        )
+        return await router.hold(
+            HoldCommand(
+                product_id=product_id,
+                quantity=quantity,
+                idempotency_key=idempotency_key,
+            )
+        )
 
-        return None
+
+@dataclass(frozen=True, slots=True)
+class _InternalInventoryProvider:
+    provider_id: UUID
+    inventory_repository: InventoryRepository
+
+    async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
+        snapshot = await self.inventory_repository.try_hold(
+            product_id=command.product_id,
+            provider_id=self.provider_id,
+            quantity=command.quantity,
+        )
+        if snapshot is None:
+            return ProviderHoldAttempt.out_of_stock()
+        return ProviderHoldAttempt.held()

@@ -49,22 +49,25 @@ class SqlAlchemyReservationRepository:
 
                 inventory_repository = InventoryRepository(self._session)
                 for item_model in reservation_model.items:
-                    snapshot = await inventory_repository.try_hold_internal(
+                    hold_idempotency_key = (
+                        f"reservation:{reservation.id}:product:{item_model.product_id}:hold"
+                    )
+                    hold = await inventory_repository.try_hold_internal(
                         product_id=item_model.product_id,
                         quantity=item_model.requested_quantity,
+                        idempotency_key=hold_idempotency_key,
                     )
-                    if snapshot is None:
+                    if hold is None:
                         raise _InsufficientInternalInventoryError
 
                     self._session.add(
                         InventoryAllocationModel(
                             reservation_item_id=item_model.id,
-                            provider_id=snapshot.provider_id,
+                            provider_id=hold.provider_id,
                             quantity=item_model.requested_quantity,
                             status=AllocationStatus.HELD,
-                            hold_idempotency_key=(
-                                f"reservation:{reservation.id}:product:{item_model.product_id}:hold"
-                            ),
+                            hold_idempotency_key=hold_idempotency_key,
+                            provider_hold_reference=hold.reference,
                         )
                     )
         except _InsufficientInternalInventoryError:
