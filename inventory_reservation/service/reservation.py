@@ -2,6 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
+from hashlib import sha256
 from typing import Protocol
 from uuid import UUID
 
@@ -36,10 +37,23 @@ class ReservationItem:
 
 
 @dataclass(frozen=True, slots=True)
+class ReservationDraft:
+    reservation_id: UUID
+    user_id: UUID
+    items: tuple[ReservationItem, ...]
+    idempotency_key: str
+    request_fingerprint: str
+    now: datetime
+    ttl: timedelta
+
+
+@dataclass(frozen=True, slots=True)
 class Reservation:
     id: UUID
     user_id: UUID
     items: tuple[ReservationItem, ...]
+    idempotency_key: str
+    request_fingerprint: str
     created_at: datetime
     expires_at: datetime
     status: ReservationStatus = field(
@@ -56,21 +70,15 @@ class Reservation:
             raise InvalidReservationTtlError(ttl)
 
     @classmethod
-    def start(
-        cls,
-        *,
-        reservation_id: UUID,
-        user_id: UUID,
-        items: tuple[ReservationItem, ...],
-        now: datetime,
-        ttl: timedelta,
-    ) -> Reservation:
+    def start(cls, draft: ReservationDraft) -> Reservation:
         return cls(
-            id=reservation_id,
-            user_id=user_id,
-            items=items,
-            created_at=now,
-            expires_at=now + ttl,
+            id=draft.reservation_id,
+            user_id=draft.user_id,
+            items=draft.items,
+            idempotency_key=draft.idempotency_key,
+            request_fingerprint=draft.request_fingerprint,
+            created_at=draft.now,
+            expires_at=draft.now + draft.ttl,
         )
 
 
@@ -82,6 +90,13 @@ class ReservationRepositoryPort(Protocol):
     async def add(self, reservation: Reservation) -> None: ...
 
     async def get(self, reservation_id: UUID) -> Reservation | None: ...
+
+    async def get_by_idempotency_key(
+        self,
+        *,
+        user_id: UUID,
+        idempotency_key: str,
+    ) -> Reservation | None: ...
 
 
 class ReservationService:
@@ -103,16 +118,37 @@ class ReservationService:
         *,
         user_id: UUID,
         items: tuple[ReservationItem, ...],
+        idempotency_key: str,
     ) -> Reservation:
-        reservation = Reservation.start(
-            reservation_id=self._reservation_id_factory(),
+        request_fingerprint = _reservation_request_fingerprint(items)
+        existing = await self._repository.get_by_idempotency_key(
             user_id=user_id,
-            items=items,
-            now=self._clock.now(),
-            ttl=self._ttl,
+            idempotency_key=idempotency_key,
+        )
+        if existing is not None:
+            return existing
+
+        reservation = Reservation.start(
+            ReservationDraft(
+                reservation_id=self._reservation_id_factory(),
+                user_id=user_id,
+                items=items,
+                idempotency_key=idempotency_key,
+                request_fingerprint=request_fingerprint,
+                now=self._clock.now(),
+                ttl=self._ttl,
+            )
         )
         await self._repository.add(reservation)
         return reservation
 
     async def get(self, reservation_id: UUID) -> Reservation | None:
         return await self._repository.get(reservation_id)
+
+
+def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:
+    canonical_items = "|".join(
+        f"{item.product_id}:{item.quantity}"
+        for item in sorted(items, key=lambda item: item.product_id.int)
+    )
+    return sha256(canonical_items.encode()).hexdigest()
