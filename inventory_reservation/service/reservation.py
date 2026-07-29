@@ -1,6 +1,8 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Protocol
 from uuid import UUID
 
 
@@ -70,3 +72,47 @@ class Reservation:
             created_at=now,
             expires_at=now + ttl,
         )
+
+
+class Clock(Protocol):
+    def now(self) -> datetime: ...
+
+
+class ReservationRepositoryPort(Protocol):
+    async def add(self, reservation: Reservation) -> None: ...
+
+    async def get(self, reservation_id: UUID) -> Reservation | None: ...
+
+
+class ReservationService:
+    def __init__(
+        self,
+        *,
+        repository: ReservationRepositoryPort,
+        clock: Clock,
+        reservation_id_factory: Callable[[], UUID],
+        ttl: timedelta,
+    ) -> None:
+        self._repository = repository
+        self._clock = clock
+        self._reservation_id_factory = reservation_id_factory
+        self._ttl = ttl
+
+    async def create(
+        self,
+        *,
+        user_id: UUID,
+        items: tuple[ReservationItem, ...],
+    ) -> Reservation:
+        reservation = Reservation.start(
+            reservation_id=self._reservation_id_factory(),
+            user_id=user_id,
+            items=items,
+            now=self._clock.now(),
+            ttl=self._ttl,
+        )
+        await self._repository.add(reservation)
+        return reservation
+
+    async def get(self, reservation_id: UUID) -> Reservation | None:
+        return await self._repository.get(reservation_id)
