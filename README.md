@@ -1,98 +1,259 @@
 # Inventory Reservation Service
 
-A production-minded inventory reservation service built with Python, FastAPI,
-PostgreSQL, Domain-Driven Design, Clean Architecture, and test-driven
-development.
+A production-minded checkout inventory service built with Python 3.14,
+FastAPI, PostgreSQL, SQLAlchemy, Alembic, and Prometheus.
 
-## Status
+The service temporarily reserves stock while payment is in progress, confirms
+the reservation after successful payment, and releases it after cancellation
+or expiry. It can allocate inventory from the platform or external providers
+without overselling internal stock or blindly failing over after an ambiguous
+remote timeout.
 
-The project is under active implementation. Architecture, local-development,
-testing, and demo instructions will be documented as each vertical slice is
-completed.
+## What is implemented
 
-## Requirements
+- Atomic, concurrency-safe internal inventory holds.
+- Idempotent reservation creation, confirmation, and cancellation.
+- Multi-item reservation with compensating release on partial failure.
+- Capability- and priority-aware provider routing.
+- Internal inventory and HTTP-based external providers.
+- Definite out-of-stock/unavailable failover to the next provider.
+- Timeout handling as an unknown outcome, preventing unsafe double holds.
+- Per-provider circuit breakers with a single half-open recovery probe.
+- Durable reconciliation of unknown confirm and release operations.
+- Automatic expiry with horizontally safe `FOR UPDATE SKIP LOCKED` workers.
+- Product, provider, credential-reference, and inventory management APIs.
+- One-order-per-confirmed-reservation database invariant.
+- Liveness, database readiness, Prometheus metrics, and structured worker logs.
+- Multi-stage non-root Docker image, Docker Compose stack, and GitHub Actions CI.
 
-- Python 3.14
-- [uv](https://docs.astral.sh/uv/)
-- PostgreSQL 17
-- Docker and Docker Compose for the complete local environment
+The project uses Domain-Driven Design language and Clean Architecture
+dependency inversion within a pragmatic three-layer design. The runtime call
+flow is:
 
-## Dependency setup
-
-```bash
-uv sync --extra dev
+```text
+HTTP / worker controller
+          ↓
+domain service and use-case orchestration
+          ↓
+PostgreSQL and external-provider repositories
 ```
 
-For pip-based environments:
+The service layer has no FastAPI, SQLAlchemy, or HTTPX dependency. It defines
+the ports implemented by infrastructure adapters.
+
+## Quick start with Docker
+
+Requirements: a recent Docker Desktop or Docker Engine with Compose v2
+(`--wait` support) and BuildKit.
 
 ```bash
-python -m pip install -r requirements-dev.txt
+cp .env.example .env
+docker compose up -d --build --wait
 ```
 
-## Local PostgreSQL
+This starts PostgreSQL, applies Alembic migrations, and runs the API plus both
+background workers.
 
-Start PostgreSQL and wait for its healthcheck:
+| Process | Address | Purpose |
+| --- | --- | --- |
+| API | `http://localhost:8000` | Checkout and management APIs |
+| OpenAPI | `http://localhost:8000/docs` | Interactive API documentation |
+| API metrics | `http://localhost:8000/metrics` | HTTP request and latency metrics |
+| Expiration metrics | `http://localhost:9101/metrics` | Expiry worker metrics |
+| Reconciliation metrics | `http://localhost:9102/metrics` | Recovery worker metrics |
+
+Compose waits for the API and both workers to become healthy. Inspect all
+processes:
 
 ```bash
-docker compose up -d --wait postgres
+docker compose ps
 ```
 
-Run the database connectivity test:
+Verify API-process liveness and its PostgreSQL dependency:
 
 ```bash
-uv run pytest tests/repository/test_database.py
+curl --fail http://localhost:8000/health/live
+curl --fail http://localhost:8000/health/ready
 ```
 
-Apply the latest database schema:
+Expected responses:
+
+```json
+{"status":"ok"}
+{"status":"ready","checks":{"database":"up"}}
+```
+
+Stop the stack while retaining PostgreSQL data:
 
 ```bash
-uv run alembic upgrade head
+docker compose down
 ```
 
-Verify that SQLAlchemy metadata and migrations have not drifted:
+To remove the local database volume as well:
 
 ```bash
-uv run alembic check
+docker compose down --volumes
 ```
 
-Run the reservation expiration worker in a separate process:
+## Checkout demo
+
+Run the stack first, then execute the following commands from the repository
+root. This is the happy-path checkout demonstration: it creates a product,
+configures an internal provider with five units, reserves two units, confirms
+the reservation, and verifies that three units remain. Provider faults,
+cancellation, expiry, and reconciliation are covered by the automated tests.
 
 ```bash
-uv run reservation-expiration-worker
+DEMO_SUFFIX=$(date +%s)
+DEMO_USER_ID=0191f4b8-7d4a-7000-8000-000000000001
 ```
 
-The worker handles `SIGINT` and `SIGTERM` gracefully. Its batch size and polling
-interval can be configured with `EXPIRATION_BATCH_SIZE` and
-`EXPIRATION_POLL_INTERVAL_SECONDS`. It emits structured JSON logs and exposes
-Prometheus metrics at `http://localhost:9101/metrics`. The metrics address can
-be changed with `EXPIRATION_METRICS_HOST` and `EXPIRATION_METRICS_PORT`.
-
-Run unknown provider outcome reconciliation as an independent process:
+Create a product:
 
 ```bash
-uv run reservation-reconciliation-worker
+PRODUCT_ID=$(
+  curl --fail --silent --show-error \
+    --request POST http://localhost:8000/internal/v1/products \
+    --header 'Content-Type: application/json' \
+    --data "{\"sku\":\"DEMO-${DEMO_SUFFIX}\",\"name\":\"Demo product\"}" |
+  docker compose exec -T api \
+    python -c 'import json, sys; print(json.load(sys.stdin)["id"])'
+)
+echo "product: ${PRODUCT_ID}"
 ```
 
-The reconciliation worker retries unknown confirm and release operations with
-their original idempotency keys. It uses a persisted exponential backoff, a
-bounded attempt count, `FOR UPDATE SKIP LOCKED` batching, graceful shutdown,
-structured JSON logs, and Prometheus metrics at
-`http://localhost:9102/metrics`.
-
-Its behavior is configurable with `RECONCILIATION_BATCH_SIZE`,
-`RECONCILIATION_MAX_ATTEMPTS`, `RECONCILIATION_POLL_INTERVAL_SECONDS`, and
-`RECONCILIATION_RETRY_BASE_DELAY_SECONDS`. The metrics listener can be changed
-with `RECONCILIATION_METRICS_HOST` and `RECONCILIATION_METRICS_PORT`.
-
-## Provider credentials
-
-Provider credential configuration stores only a reference to secret material.
-The default resolver reads references in the form `env://VARIABLE_NAME` when a
-hold, confirmation, or release request is sent:
+Register and enable an internal provider:
 
 ```bash
-export ACME_PROVIDER_TOKEN="replace-with-runtime-secret"
+PROVIDER_ID=$(
+  curl --fail --silent --show-error \
+    --request POST http://localhost:8000/internal/v1/providers \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"name\":\"demo-internal-${DEMO_SUFFIX}\",
+      \"kind\":\"internal\",
+      \"driver\":\"internal\",
+      \"request_timeout_ms\":500,
+      \"capabilities\":{
+        \"availability\":true,
+        \"hold\":true,
+        \"confirm\":true,
+        \"release\":true
+      }
+    }" |
+  docker compose exec -T api \
+    python -c 'import json, sys; print(json.load(sys.stdin)["id"])'
+)
+
+curl --fail --silent --show-error \
+  --request POST \
+  "http://localhost:8000/internal/v1/providers/${PROVIDER_ID}/enable" |
+docker compose exec -T api python -m json.tool
 ```
+
+Assign five units of inventory:
+
+```bash
+INVENTORY_URL="http://localhost:8000/internal/v1/products/${PRODUCT_ID}/providers/${PROVIDER_ID}/inventory"
+
+curl --fail --silent --show-error \
+  --request PUT "${INVENTORY_URL}" \
+  --header 'Content-Type: application/json' \
+  --data '{"on_hand":5,"allocation_priority":10}' |
+docker compose exec -T api python -m json.tool
+```
+
+Create a reservation. Repeating this request with the same body and
+`Idempotency-Key` returns the same reservation.
+
+```bash
+RESERVATION_JSON=$(
+  curl --fail --silent --show-error \
+    --request POST http://localhost:8000/v1/reservations \
+    --header "X-User-ID: ${DEMO_USER_ID}" \
+    --header "Idempotency-Key: demo-checkout-${DEMO_SUFFIX}" \
+    --header 'Content-Type: application/json' \
+    --data "{
+      \"items\":[{
+        \"product_id\":\"${PRODUCT_ID}\",
+        \"quantity\":2
+      }]
+    }"
+)
+echo "${RESERVATION_JSON}" |
+docker compose exec -T api python -m json.tool
+
+RESERVATION_ID=$(
+  echo "${RESERVATION_JSON}" |
+  docker compose exec -T api \
+    python -c 'import json, sys; print(json.load(sys.stdin)["id"])'
+)
+```
+
+Confirm the reservation. Repeating confirmation is also safe.
+
+```bash
+curl --fail --silent --show-error \
+  --request POST \
+  "http://localhost:8000/v1/reservations/${RESERVATION_ID}/confirm" \
+  --header "X-User-ID: ${DEMO_USER_ID}" |
+docker compose exec -T api python -m json.tool
+```
+
+Verify the final inventory:
+
+```bash
+curl --fail --silent --show-error "${INVENTORY_URL}" |
+docker compose exec -T api python -m json.tool
+```
+
+The final inventory response contains:
+
+```json
+{
+  "on_hand": 3,
+  "reserved": 0,
+  "available": 3
+}
+```
+
+After completing the development setup below, the automated equivalent is:
+
+```bash
+uv run pytest tests/e2e/test_checkout.py -vv
+```
+
+That test runs the FastAPI application in-process against the configured
+PostgreSQL database and removes the records it creates. It does not call the
+already-running Compose API.
+
+## Provider behavior
+
+Inventory levels define provider eligibility and deterministic allocation
+priority. For an external provider, the inventory row is routing
+configuration—not an authoritative live-stock mirror. The remote hold response
+decides availability. A hold-capable external provider uses this contract:
+
+- `POST /holds`
+- `POST /holds/{hold_reference}/confirm`
+- `POST /holds/{hold_reference}/release`
+
+Every operation receives a deterministic `Idempotency-Key`.
+
+A conclusive out-of-stock response or temporary unavailability, such as a
+server failure or open circuit, can fall through to the next eligible
+provider. A timeout cannot: the provider may have accepted the hold before the
+response was lost, so the request fails closed instead of risking a double
+reservation.
+
+Unknown confirmation and release outcomes are persisted in `confirming` or
+`releasing` state and retried by the reconciliation worker. An unknown initial
+hold is deliberately not retried or failed over, but it is not yet durably
+reconciled; closing that crash/timeout gap requires a persisted hold intent and
+a provider status-query contract.
+
+Provider secrets are never stored directly. Credential configuration contains
+an `env://VARIABLE_NAME` reference resolved at call time:
 
 ```json
 {
@@ -105,35 +266,152 @@ export ACME_PROVIDER_TOKEN="replace-with-runtime-secret"
 }
 ```
 
-Send that document with
-`PUT /internal/v1/providers/{provider_id}/credentials`. API Key, Bearer,
-Basic, OAuth2, and unauthenticated providers are supported. The secret value
-is resolved for each provider operation and is never stored in PostgreSQL.
+The referenced secret must be available to every runtime that may call the
+provider—the API and both workers. A host export or Compose `.env` entry alone
+does not inject an arbitrary variable into a container. For a local external
+provider demo, create an uncommitted `compose.provider-secrets.yaml`:
 
-Stop the local services without deleting database data:
-
-```bash
-docker compose down
+```yaml
+services:
+  api:
+    environment:
+      ACME_PROVIDER_TOKEN: ${ACME_PROVIDER_TOKEN:?set ACME_PROVIDER_TOKEN}
+  expiration-worker:
+    environment:
+      ACME_PROVIDER_TOKEN: ${ACME_PROVIDER_TOKEN:?set ACME_PROVIDER_TOKEN}
+  reconciliation-worker:
+    environment:
+      ACME_PROVIDER_TOKEN: ${ACME_PROVIDER_TOKEN:?set ACME_PROVIDER_TOKEN}
 ```
 
-## Architecture
+Then export the secret and apply the override:
 
-The service uses a direct three-layer request flow:
+```bash
+export ACME_PROVIDER_TOKEN='replace-with-runtime-secret'
+docker compose \
+  --file compose.yaml \
+  --file compose.provider-secrets.yaml \
+  up -d --build --wait
+```
+
+Use a provider-specific variable name and do not commit secret-bearing
+configuration. Production deployments should replace the environment resolver
+with Vault or a cloud secret manager.
+
+API key, Bearer, Basic, pre-resolved OAuth2 bearer-token, and unauthenticated
+HTTP header configurations are supported. OAuth2 token acquisition and
+refresh are outside the current adapter.
+
+## Development setup
+
+Requirements:
+
+- Python 3.14
+- [uv](https://docs.astral.sh/uv/)
+- PostgreSQL 17, normally via Docker
+
+Install the locked development environment:
+
+```bash
+uv sync --extra dev
+docker compose up -d --wait postgres
+uv run alembic upgrade head
+```
+
+Copying `.env.example` to `.env` is optional; the application and Compose file
+have matching local defaults. Create `.env` only when overriding them.
+
+Run the API locally:
+
+```bash
+uv run uvicorn inventory_reservation.controller.main:app --reload
+```
+
+Run workers in separate terminals when needed:
+
+```bash
+uv run reservation-expiration-worker
+uv run reservation-reconciliation-worker
+```
+
+Configuration defaults are documented in `.env.example`. Important controls
+include reservation TTL, provider circuit-breaker thresholds, worker batch
+sizes, polling intervals, retry limits, and metrics ports.
+
+## Tests and quality gates
+
+The test suite is organized around confirmed public seams rather than private
+implementation details:
+
+- `tests/service`: domain behavior, provider routing, circuit breaking, and
+  worker policy.
+- `tests/controller`: HTTP validation, status codes, and response contracts.
+- `tests/repository`: PostgreSQL concurrency, migrations, and external HTTP
+  provider contracts.
+- `tests/e2e`: complete HTTP checkout backed by PostgreSQL.
+
+After installing dependencies and starting PostgreSQL, run the same core
+checks used in CI:
+
+```bash
+docker compose up -d --wait postgres
+uv run ruff check .
+uv run mypy inventory_reservation
+uv run alembic upgrade head
+uv run alembic check
+uv run pytest --cov=inventory_reservation --cov-report=term-missing
+docker compose config --quiet
+docker build --check .
+```
+
+Coverage is branch-aware and enforced at a minimum of 85%. The suite includes
+concurrent hold tests, idempotency races, provider timeout and failover cases,
+multi-item compensation, reconciliation backoff, worker behavior, and a full
+HTTP checkout.
+
+## Repository guide
 
 ```text
 inventory_reservation/
-├── controller/  # FastAPI routes and transport contracts
-├── service/     # Business rules and workflow orchestration
-└── repository/  # PostgreSQL and external-provider access
+├── controller/  FastAPI routes, composition roots, and worker entry points
+├── service/     Domain models, ports, policies, and use cases
+└── repository/  PostgreSQL and external-provider adapters
+
+migrations/      Alembic migration history
+tests/           Controller, service, repository, and E2E tests
+docs/            Schema documentation and architectural decisions
 ```
 
-Dependencies flow from `controller` to `service` to `repository`. See
-[`ARCHITECTURE.md`](ARCHITECTURE.md) for the design reasoning and explicit
-trade-offs, [`SCALABILITY.md`](SCALABILITY.md) for bottlenecks and the
-evidence-driven scaling plan,
-[`CONTEXT.md`](CONTEXT.md) for the ubiquitous language and test seams, and
-[`docs/adr/0001-three-layer-architecture.md`](docs/adr/0001-three-layer-architecture.md)
-for the architectural decision.
+Read these documents in order:
 
-The tables, constraints, and operational indexes are described in
-[`docs/database-schema.md`](docs/database-schema.md).
+1. [`CONTEXT.md`](CONTEXT.md) — bounded context, ubiquitous language, and test
+   seams.
+2. [`ARCHITECTURE.md`](ARCHITECTURE.md) — lifecycle, consistency model,
+   provider failure semantics, and trade-offs.
+3. [`SCALABILITY.md`](SCALABILITY.md) — bottlenecks, metrics, and staged
+   scaling plan.
+4. [`docs/database-schema.md`](docs/database-schema.md) — tables, constraints,
+   and operational indexes.
+5. [`docs/adr/0001-three-layer-architecture.md`](docs/adr/0001-three-layer-architecture.md)
+   — why the project uses a direct three-layer structure.
+
+## Deliberate boundaries
+
+- Authentication, cart, product catalog ownership, and payment execution are
+  outside this bounded context. `X-User-ID` and payment outcomes are assumed
+  to come from trusted upstream services.
+- Management endpoints are intentionally unauthenticated for the take-home
+  environment and must be protected by an internal gateway or service identity
+  before production use.
+- PostgreSQL is the source of truth for reservations, orders, provider
+  operation state, and internal inventory; cache is not used to authorize
+  internal holds. An external provider remains authoritative for stock it
+  owns.
+- External calls currently occur inside database transactions. The first
+  scale-driven redesign would persist an operation intent and execute remote
+  I/O outside the transaction.
+- A single provider must satisfy an item; split fulfillment is not implemented.
+
+The deeper reasoning and production evolution plan are intentionally kept in
+`ARCHITECTURE.md` and `SCALABILITY.md` so this README stays executable and
+reviewer-focused.

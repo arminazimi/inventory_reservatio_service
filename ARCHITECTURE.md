@@ -61,6 +61,7 @@ flowchart LR
     Caller["Checkout / payment caller"] --> API["FastAPI process"]
     API --> DB[("PostgreSQL")]
     API --> Provider["External inventory providers"]
+    API --> Metrics0["Prometheus /metrics"]
     Expiry["Expiration worker"] --> DB
     Expiry --> Provider
     Reconcile["Reconciliation worker"] --> DB
@@ -297,9 +298,8 @@ Other follow-up work, in order, would be:
    including manual retry or resolution with a complete audit trail;
 2. accept payment outcomes through an idempotent event consumer and publish
    `OrderCreated` through an outbox when event-driven integration is required;
-3. add readiness/liveness endpoints, OpenTelemetry traces across SQL and
-   provider calls, API latency/error metrics, and Sentry-style exception
-   capture;
+3. add OpenTelemetry traces across SQL and provider calls, provider-level
+   metrics, backlog-age gauges, and Sentry-style exception capture;
 4. implement Vault or cloud-secret-manager resolver adapters with caching,
    rotation notifications, and resolver health metrics;
 5. run contract, load, and fault-injection tests to tune batch sizes,

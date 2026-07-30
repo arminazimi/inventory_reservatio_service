@@ -266,9 +266,12 @@ use local replicas only for non-authoritative reads.
 
 ## Metrics and Decision Triggers
 
-The current workers expose Prometheus counters, batch-duration histograms,
-reservation outcome counters, and last-success timestamps. That is enough to
-verify that loops are alive, but not enough to plan capacity.
+The API exposes Prometheus request counters, in-flight gauges, and request
+duration histograms using bounded route-template labels. The workers expose
+batch counters, duration histograms, reservation outcome counters, and
+last-success timestamps. These establish service health, but dashboards,
+alerts, provider-level measurements, and backlog-age gauges are still needed
+for capacity planning.
 
 Before increasing scale, add:
 
