@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from sqlalchemy import select
 
 from inventory_reservation.repository.database import Database
@@ -22,6 +24,20 @@ class SqlAlchemyProviderRepository:
             providers = (await session.scalars(statement)).all()
 
         return tuple(self._to_domain(provider) for provider in providers)
+
+    async def get(
+        self,
+        provider_id: UUID,
+    ) -> ProviderConfiguration | None:
+        statement = select(InventoryProviderModel).where(
+            InventoryProviderModel.id == provider_id
+        )
+        async with self._database.session() as session:
+            provider = (await session.scalars(statement)).one_or_none()
+
+        if provider is None:
+            return None
+        return self._to_domain(provider)
 
     @staticmethod
     def _to_domain(provider: InventoryProviderModel) -> ProviderConfiguration:

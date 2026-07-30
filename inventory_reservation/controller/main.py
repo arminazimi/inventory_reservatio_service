@@ -8,7 +8,10 @@ import httpx
 from fastapi import FastAPI
 from starlette.types import Lifespan
 
-from inventory_reservation.controller.provider import create_provider_router
+from inventory_reservation.controller.provider import (
+    create_provider_router,
+    handle_provider_not_found,
+)
 from inventory_reservation.controller.reservation import (
     ReservationNotFoundError,
     create_reservation_router,
@@ -27,6 +30,7 @@ from inventory_reservation.repository.provider_management import (
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.provider_management import (
     ProviderManagementService,
+    ProviderNotFoundError,
 )
 from inventory_reservation.service.reservation import (
     IdempotencyConflictError,
@@ -64,6 +68,10 @@ def create_app(
         app.include_router(
             create_provider_router(provider_management_service)
         )
+    app.add_exception_handler(
+        ProviderNotFoundError,
+        handle_provider_not_found,
+    )
     app.add_exception_handler(
         IdempotencyConflictError,
         handle_idempotency_conflict,

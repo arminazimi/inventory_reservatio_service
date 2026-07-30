@@ -112,3 +112,59 @@ async def test_repository_lists_provider_configurations_in_name_order() -> None:
                 )
             )
         await database.close()
+
+
+@pytest.mark.integration
+async def test_repository_gets_provider_configuration_by_id() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    provider_id = uuid7()
+    suffix = provider_id.hex
+
+    try:
+        async with database.session() as session, session.begin():
+            session.add(
+                InventoryProviderModel(
+                    id=provider_id,
+                    name=f"provider-get-{suffix}",
+                    kind=ProviderKindModel.EXTERNAL,
+                    driver="http",
+                    base_url="https://provider-get.test",
+                    request_timeout_ms=750,
+                    supports_availability=True,
+                    supports_hold=True,
+                    supports_confirm=True,
+                    supports_release=False,
+                    is_enabled=True,
+                )
+            )
+
+        provider = await SqlAlchemyProviderRepository(database).get(provider_id)
+
+        assert provider == ProviderConfiguration(
+            id=provider_id,
+            name=f"provider-get-{suffix}",
+            kind=ProviderKind.EXTERNAL,
+            driver="http",
+            base_url="https://provider-get.test",
+            request_timeout_ms=750,
+            capabilities=ProviderCapabilities(
+                availability=True,
+                hold=True,
+                confirm=True,
+                release=False,
+            ),
+            is_enabled=True,
+        )
+    finally:
+        async with database.session() as session, session.begin():
+            await session.execute(
+                delete(InventoryProviderModel).where(
+                    InventoryProviderModel.id == provider_id
+                )
+            )
+        await database.close()
