@@ -10,6 +10,8 @@ from starlette.types import Lifespan
 
 from inventory_reservation.controller.provider import (
     create_provider_router,
+    handle_invalid_provider_configuration,
+    handle_provider_name_conflict,
     handle_provider_not_found,
 )
 from inventory_reservation.controller.reservation import (
@@ -29,7 +31,9 @@ from inventory_reservation.repository.provider_management import (
 )
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.provider_management import (
+    InvalidProviderConfigurationError,
     ProviderManagementService,
+    ProviderNameConflictError,
     ProviderNotFoundError,
 )
 from inventory_reservation.service.reservation import (
@@ -71,6 +75,14 @@ def create_app(
     app.add_exception_handler(
         ProviderNotFoundError,
         handle_provider_not_found,
+    )
+    app.add_exception_handler(
+        InvalidProviderConfigurationError,
+        handle_invalid_provider_configuration,
+    )
+    app.add_exception_handler(
+        ProviderNameConflictError,
+        handle_provider_name_conflict,
     )
     app.add_exception_handler(
         IdempotencyConflictError,

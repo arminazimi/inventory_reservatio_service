@@ -18,6 +18,7 @@ from inventory_reservation.service.provider_management import (
     ProviderCapabilities,
     ProviderConfiguration,
     ProviderKind,
+    ProviderNameConflictError,
 )
 
 
@@ -165,6 +166,105 @@ async def test_repository_gets_provider_configuration_by_id() -> None:
             await session.execute(
                 delete(InventoryProviderModel).where(
                     InventoryProviderModel.id == provider_id
+                )
+            )
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_repository_adds_provider_configuration() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name=f"provider-add-{provider_id.hex}",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://provider-add.test",
+        request_timeout_ms=900,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+
+    try:
+        repository = SqlAlchemyProviderRepository(database)
+
+        await repository.add(provider)
+
+        assert await repository.get(provider_id) == provider
+    finally:
+        async with database.session() as session, session.begin():
+            await session.execute(
+                delete(InventoryProviderModel).where(
+                    InventoryProviderModel.id == provider_id
+                )
+            )
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_repository_maps_duplicate_provider_name_to_domain_conflict() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    provider_name = f"provider-duplicate-{uuid7().hex}"
+    existing_provider = ProviderConfiguration(
+        id=uuid7(),
+        name=provider_name,
+        kind=ProviderKind.INTERNAL,
+        driver="internal",
+        base_url=None,
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    duplicate_provider = ProviderConfiguration(
+        id=uuid7(),
+        name=provider_name,
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://duplicate-provider.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+
+    try:
+        repository = SqlAlchemyProviderRepository(database)
+        await repository.add(existing_provider)
+
+        with pytest.raises(ProviderNameConflictError):
+            await repository.add(duplicate_provider)
+    finally:
+        async with database.session() as session, session.begin():
+            await session.execute(
+                delete(InventoryProviderModel).where(
+                    InventoryProviderModel.id.in_(
+                        (existing_provider.id, duplicate_provider.id)
+                    )
                 )
             )
         await database.close()
