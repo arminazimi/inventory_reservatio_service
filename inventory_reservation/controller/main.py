@@ -8,6 +8,7 @@ import httpx
 from fastapi import FastAPI
 from starlette.types import Lifespan
 
+from inventory_reservation.controller.provider import create_provider_router
 from inventory_reservation.controller.reservation import (
     ReservationNotFoundError,
     create_reservation_router,
@@ -20,7 +21,13 @@ from inventory_reservation.controller.reservation import (
 )
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.provider import ProviderRegistry
+from inventory_reservation.repository.provider_management import (
+    SqlAlchemyProviderRepository,
+)
 from inventory_reservation.repository.reservation import reservation_transaction
+from inventory_reservation.service.provider_management import (
+    ProviderManagementService,
+)
 from inventory_reservation.service.reservation import (
     IdempotencyConflictError,
     InsufficientInventoryError,
@@ -44,6 +51,7 @@ class UtcClock:
 def create_app(
     *,
     reservation_service: ReservationService,
+    provider_management_service: ProviderManagementService | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     app = FastAPI(
@@ -52,6 +60,10 @@ def create_app(
         lifespan=lifespan,
     )
     app.include_router(create_reservation_router(reservation_service))
+    if provider_management_service is not None:
+        app.include_router(
+            create_provider_router(provider_management_service)
+        )
     app.add_exception_handler(
         IdempotencyConflictError,
         handle_idempotency_conflict,
@@ -116,6 +128,9 @@ def build_app(
             )
         ),
     )
+    provider_management_service = ProviderManagementService(
+        repository=SqlAlchemyProviderRepository(database),
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -129,6 +144,7 @@ def build_app(
 
     return create_app(
         reservation_service=reservation_service,
+        provider_management_service=provider_management_service,
         lifespan=lifespan,
     )
 
