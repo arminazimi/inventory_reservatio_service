@@ -8,6 +8,11 @@ import httpx
 from fastapi import FastAPI
 from starlette.types import Lifespan
 
+from inventory_reservation.controller.product import (
+    create_product_router,
+    handle_invalid_product_configuration,
+    handle_product_sku_conflict,
+)
 from inventory_reservation.controller.provider import (
     create_provider_router,
     handle_invalid_provider_configuration,
@@ -25,6 +30,9 @@ from inventory_reservation.controller.reservation import (
     handle_reservation_not_found,
 )
 from inventory_reservation.repository.database import Database
+from inventory_reservation.repository.product import (
+    SqlAlchemyProductRepository,
+)
 from inventory_reservation.repository.provider import (
     EnvironmentSecretResolver,
     ProviderRegistry,
@@ -33,6 +41,11 @@ from inventory_reservation.repository.provider_management import (
     SqlAlchemyProviderRepository,
 )
 from inventory_reservation.repository.reservation import reservation_transaction
+from inventory_reservation.service.product import (
+    InvalidProductConfigurationError,
+    ProductManagementService,
+    ProductSkuConflictError,
+)
 from inventory_reservation.service.provider_management import (
     InvalidProviderConfigurationError,
     ProviderManagementService,
@@ -63,6 +76,7 @@ def create_app(
     *,
     reservation_service: ReservationService,
     provider_management_service: ProviderManagementService | None = None,
+    product_management_service: ProductManagementService | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     app = FastAPI(
@@ -75,6 +89,18 @@ def create_app(
         app.include_router(
             create_provider_router(provider_management_service)
         )
+    if product_management_service is not None:
+        app.include_router(
+            create_product_router(product_management_service)
+        )
+    app.add_exception_handler(
+        InvalidProductConfigurationError,
+        handle_invalid_product_configuration,
+    )
+    app.add_exception_handler(
+        ProductSkuConflictError,
+        handle_product_sku_conflict,
+    )
     app.add_exception_handler(
         ProviderNotFoundError,
         handle_provider_not_found,
@@ -155,6 +181,9 @@ def build_app(
     provider_management_service = ProviderManagementService(
         repository=SqlAlchemyProviderRepository(database),
     )
+    product_management_service = ProductManagementService(
+        repository=SqlAlchemyProductRepository(database),
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -169,6 +198,7 @@ def build_app(
     return create_app(
         reservation_service=reservation_service,
         provider_management_service=provider_management_service,
+        product_management_service=product_management_service,
         lifespan=lifespan,
     )
 
