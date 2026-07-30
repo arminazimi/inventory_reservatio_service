@@ -1,12 +1,13 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Path, Request, status
+from fastapi import APIRouter, Path, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import JSONResponse
 
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
+    InventoryHasActiveReservationsError,
     InventoryLevel,
     InventoryLevelNotFoundError,
     InventoryManagementService,
@@ -101,6 +102,28 @@ async def handle_inventory_level_not_found(
     )
 
 
+async def handle_inventory_has_active_reservations(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, InventoryHasActiveReservationsError):
+        raise error
+
+    response = InventoryErrorResponse(
+        error=InventoryErrorDetail(
+            code="inventory_has_active_reservations",
+            message=str(error),
+            product_id=error.product_id,
+            provider_id=error.provider_id,
+            reserved=error.reserved,
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=response.model_dump(mode="json", exclude_none=True),
+    )
+
+
 def create_inventory_management_router(
     inventory_management: InventoryManagementService,
 ) -> APIRouter:
@@ -139,6 +162,30 @@ def create_inventory_management_router(
             provider_id=provider_id,
         )
         return InventoryLevelResponse.from_domain(level)
+
+    @router.delete(
+        "/{product_id}/providers/{provider_id}/inventory",
+        status_code=status.HTTP_204_NO_CONTENT,
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": InventoryErrorResponse,
+                "description": "Inventory assignment was not found.",
+            },
+            status.HTTP_409_CONFLICT: {
+                "model": InventoryErrorResponse,
+                "description": "Inventory has active reservations.",
+            }
+        },
+    )
+    async def remove_inventory_level(
+        product_id: Annotated[UUID, Path()],
+        provider_id: Annotated[UUID, Path()],
+    ) -> Response:
+        await inventory_management.remove_inventory_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.put(
         "/{product_id}/providers/{provider_id}/inventory",

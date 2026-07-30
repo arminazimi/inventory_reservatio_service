@@ -46,6 +46,22 @@ class InventoryBelowReservedError(ValueError):
         )
 
 
+class InventoryHasActiveReservationsError(ValueError):
+    def __init__(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+        reserved: int,
+    ) -> None:
+        self.product_id = product_id
+        self.provider_id = provider_id
+        self.reserved = reserved
+        super().__init__(
+            "Inventory with active reservations cannot be unassigned."
+        )
+
+
 class InventoryLevelNotFoundError(LookupError):
     def __init__(
         self,
@@ -77,6 +93,13 @@ class InventoryLevelRepositoryPort(Protocol):
         product_id: UUID,
         provider_id: UUID,
     ) -> InventoryLevel | None: ...
+
+    async def remove_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> bool: ...
 
     async def set_level(
         self,
@@ -124,6 +147,26 @@ class InventoryManagementService:
                 provider_id=provider_id,
             )
         return level
+
+    async def remove_inventory_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> None:
+        if not await self._repository.product_exists(product_id):
+            raise ProductNotFoundError(product_id)
+        if not await self._repository.provider_exists(provider_id):
+            raise ProviderNotFoundError(provider_id)
+        removed = await self._repository.remove_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
+        if not removed:
+            raise InventoryLevelNotFoundError(
+                product_id=product_id,
+                provider_id=provider_id,
+            )
 
     async def set_inventory_level(
         self,

@@ -11,6 +11,7 @@ from starlette.types import Lifespan
 from inventory_reservation.controller.inventory_management import (
     create_inventory_management_router,
     handle_inventory_below_reserved,
+    handle_inventory_has_active_reservations,
     handle_inventory_level_not_found,
 )
 from inventory_reservation.controller.product import (
@@ -52,6 +53,7 @@ from inventory_reservation.repository.provider_management import (
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
+    InventoryHasActiveReservationsError,
     InventoryLevelNotFoundError,
     InventoryManagementService,
 )
@@ -118,6 +120,10 @@ def create_app(
     app.add_exception_handler(
         InventoryBelowReservedError,
         handle_inventory_below_reserved,
+    )
+    app.add_exception_handler(
+        InventoryHasActiveReservationsError,
+        handle_inventory_has_active_reservations,
     )
     app.add_exception_handler(
         InventoryLevelNotFoundError,

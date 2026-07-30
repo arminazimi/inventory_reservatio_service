@@ -1,6 +1,6 @@
 from uuid import UUID, uuid7
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
 from inventory_reservation.repository.database import Database
@@ -11,6 +11,7 @@ from inventory_reservation.repository.models import (
 )
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
+    InventoryHasActiveReservationsError,
     InventoryLevel,
 )
 
@@ -68,6 +69,42 @@ class SqlAlchemyInventoryLevelRepository:
         if level is None:
             return None
         return self._to_domain(level)
+
+    async def remove_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> bool:
+        delete_statement = (
+            delete(InventoryLevelModel)
+            .where(
+                InventoryLevelModel.product_id == product_id,
+                InventoryLevelModel.provider_id == provider_id,
+                InventoryLevelModel.reserved == 0,
+            )
+            .returning(InventoryLevelModel.id)
+        )
+        async with self._database.session() as session, session.begin():
+            removed_id = await session.scalar(delete_statement)
+            if removed_id is not None:
+                return True
+
+            current = (
+                await session.scalars(
+                    select(InventoryLevelModel).where(
+                        InventoryLevelModel.product_id == product_id,
+                        InventoryLevelModel.provider_id == provider_id,
+                    )
+                )
+            ).one_or_none()
+            if current is None:
+                return False
+            raise InventoryHasActiveReservationsError(
+                product_id=product_id,
+                provider_id=provider_id,
+                reserved=current.reserved,
+            )
 
     async def set_level(
         self,

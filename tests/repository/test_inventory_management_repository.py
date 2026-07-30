@@ -16,6 +16,7 @@ from inventory_reservation.repository.models import (
 )
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
+    InventoryHasActiveReservationsError,
     InventoryLevel,
 )
 
@@ -72,6 +73,14 @@ async def test_inventory_assignment_is_persisted_idempotently() -> None:
             product_id=product_id,
             provider_id=provider_id,
         )
+        removed = await repository.remove_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
+        after_removal = await repository.get_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
 
         expected = InventoryLevel(
             product_id=product_id,
@@ -86,6 +95,8 @@ async def test_inventory_assignment_is_persisted_idempotently() -> None:
             repeated_result,
             updated_result,
             retrieved_result,
+            removed,
+            after_removal,
         ) == (
             expected,
             expected,
@@ -105,6 +116,8 @@ async def test_inventory_assignment_is_persisted_idempotently() -> None:
                 allocation_priority=5,
                 version=2,
             ),
+            True,
+            None,
         )
     finally:
         async with database.session() as session, session.begin():
@@ -282,16 +295,42 @@ async def test_inventory_cannot_be_persisted_below_reserved_quantity() -> None:
             on_hand=12,
             allocation_priority=10,
         )
+        with pytest.raises(
+            InventoryHasActiveReservationsError
+        ) as removal_error:
+            await repository.remove_level(
+                product_id=product_id,
+                provider_id=provider_id,
+            )
+        after_rejected_removal = await repository.get_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
 
         assert (
             captured.value.product_id,
             captured.value.provider_id,
             captured.value.reserved,
+            removal_error.value.product_id,
+            removal_error.value.provider_id,
+            removal_error.value.reserved,
             current,
+            after_rejected_removal,
         ) == (
             product_id,
             provider_id,
             5,
+            product_id,
+            provider_id,
+            5,
+            InventoryLevel(
+                product_id=product_id,
+                provider_id=provider_id,
+                on_hand=12,
+                reserved=5,
+                allocation_priority=10,
+                version=2,
+            ),
             InventoryLevel(
                 product_id=product_id,
                 provider_id=provider_id,

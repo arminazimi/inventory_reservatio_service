@@ -6,12 +6,14 @@ from httpx import ASGITransport, AsyncClient
 from inventory_reservation.controller.inventory_management import (
     create_inventory_management_router,
     handle_inventory_below_reserved,
+    handle_inventory_has_active_reservations,
     handle_inventory_level_not_found,
 )
 from inventory_reservation.controller.product import handle_product_not_found
 from inventory_reservation.controller.provider import handle_provider_not_found
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
+    InventoryHasActiveReservationsError,
     InventoryLevel,
     InventoryLevelNotFoundError,
     InventoryManagementService,
@@ -63,6 +65,21 @@ class InMemoryInventoryLevelRepository:
         provider_id: UUID,
     ) -> InventoryLevel | None:
         return self.levels.get((product_id, provider_id))
+
+    async def remove_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> bool:
+        current = self.levels.get((product_id, provider_id))
+        if current is not None and current.reserved > 0:
+            raise InventoryHasActiveReservationsError(
+                product_id=product_id,
+                provider_id=provider_id,
+                reserved=current.reserved,
+            )
+        return self.levels.pop((product_id, provider_id), None) is not None
 
     async def set_level(
         self,
@@ -259,6 +276,80 @@ async def test_get_unassigned_product_provider_inventory_returns_not_found() -> 
             "message": "Inventory level was not found.",
             "product_id": str(PRODUCT_ID),
             "provider_id": str(PROVIDER_ID),
+        }
+    }
+
+
+async def test_operator_can_unassign_unreserved_inventory() -> None:
+    repository = InMemoryInventoryLevelRepository()
+    repository.levels[(PRODUCT_ID, PROVIDER_ID)] = InventoryLevel(
+        product_id=PRODUCT_ID,
+        provider_id=PROVIDER_ID,
+        on_hand=12,
+        reserved=0,
+        allocation_priority=10,
+        version=1,
+    )
+    service = InventoryManagementService(repository=repository)
+    app = FastAPI()
+    app.include_router(create_inventory_management_router(service))
+    assignment_url = (
+        f"/internal/v1/products/{PRODUCT_ID}"
+        f"/providers/{PROVIDER_ID}/inventory"
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        delete_response = await client.delete(assignment_url)
+        inventory_response = await client.get(
+            f"/internal/v1/products/{PRODUCT_ID}/inventory"
+        )
+
+    assert delete_response.status_code == 204
+    assert delete_response.content == b""
+    assert inventory_response.status_code == 200
+    assert inventory_response.json() == []
+
+
+async def test_inventory_with_active_reservations_cannot_be_unassigned() -> None:
+    repository = InMemoryInventoryLevelRepository()
+    repository.levels[(PRODUCT_ID, PROVIDER_ID)] = InventoryLevel(
+        product_id=PRODUCT_ID,
+        provider_id=PROVIDER_ID,
+        on_hand=12,
+        reserved=2,
+        allocation_priority=10,
+        version=3,
+    )
+    service = InventoryManagementService(repository=repository)
+    app = FastAPI()
+    app.include_router(create_inventory_management_router(service))
+    app.add_exception_handler(
+        InventoryHasActiveReservationsError,
+        handle_inventory_has_active_reservations,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.delete(
+            f"/internal/v1/products/{PRODUCT_ID}"
+            f"/providers/{PROVIDER_ID}/inventory"
+        )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": {
+            "code": "inventory_has_active_reservations",
+            "message": (
+                "Inventory with active reservations cannot be unassigned."
+            ),
+            "product_id": str(PRODUCT_ID),
+            "provider_id": str(PROVIDER_ID),
+            "reserved": 2,
         }
     }
 
