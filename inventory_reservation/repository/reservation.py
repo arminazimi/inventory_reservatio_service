@@ -16,6 +16,7 @@ from inventory_reservation.repository.models import (
     InventoryProviderModel,
     OrderItemModel,
     OrderModel,
+    ProviderCredentialModel,
     ProviderKind,
     ProviderOperationModel,
     ProviderOperationStatus,
@@ -33,6 +34,10 @@ from inventory_reservation.service.provider import (
     ProviderReleaseOutcome,
     ReleaseCommand,
 )
+from inventory_reservation.service.provider_management import (
+    ProviderAuthType,
+    ProviderCredentialConfiguration,
+)
 from inventory_reservation.service.reservation import (
     ConcurrentReservationCreationError,
     Reservation,
@@ -45,6 +50,19 @@ from inventory_reservation.service.reservation import (
 )
 
 IDEMPOTENCY_CONSTRAINT = "uq_reservations_user_id_idempotency_key"
+
+
+def _to_provider_credentials(
+    credentials: ProviderCredentialModel | None,
+) -> ProviderCredentialConfiguration | None:
+    if credentials is None:
+        return None
+    return ProviderCredentialConfiguration(
+        provider_id=credentials.provider_id,
+        auth_type=ProviderAuthType(credentials.auth_type.value),
+        secret_ref=credentials.secret_ref,
+        public_config=credentials.public_config,
+    )
 
 
 class _InventoryConfirmationError(RuntimeError):
@@ -69,6 +87,12 @@ class _ProviderOperationContext:
         retry_number = max(0, attempt_count - 2)
         delay_seconds = self.retry_base_delay.total_seconds() * (2**retry_number)
         return self.retry_started_at + timedelta(seconds=delay_seconds)
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfiguredProvider:
+    provider: InventoryProviderModel
+    credentials: ProviderCredentialModel | None
 
 
 class SqlAlchemyReservationRepository:
@@ -171,6 +195,7 @@ class SqlAlchemyReservationRepository:
                 InventoryAllocationModel,
                 ReservationItemModel.product_id,
                 InventoryProviderModel,
+                ProviderCredentialModel,
             )
             .join(
                 ReservationItemModel,
@@ -180,8 +205,13 @@ class SqlAlchemyReservationRepository:
                 InventoryProviderModel,
                 InventoryProviderModel.id == InventoryAllocationModel.provider_id,
             )
+            .outerjoin(
+                ProviderCredentialModel,
+                ProviderCredentialModel.provider_id
+                == InventoryProviderModel.id,
+            )
             .where(ReservationItemModel.reservation_id == reservation.id)
-            .with_for_update()
+            .with_for_update(of=InventoryAllocationModel)
         )
         allocations = (await self._session.execute(allocations_statement)).all()
         inventory_repository = InventoryRepository(
@@ -191,12 +221,15 @@ class SqlAlchemyReservationRepository:
         confirmation_pending = False
         confirmation_failed = False
 
-        for allocation, product_id, provider in allocations:
+        for allocation, product_id, provider, credentials in allocations:
             outcome = await self._confirm_allocation(
                 context=context,
                 allocation=allocation,
                 product_id=product_id,
-                provider=provider,
+                configured_provider=_ConfiguredProvider(
+                    provider=provider,
+                    credentials=credentials,
+                ),
                 inventory_repository=inventory_repository,
             )
             if outcome is ProviderConfirmOutcome.CONFIRMED:
@@ -388,6 +421,7 @@ class SqlAlchemyReservationRepository:
                 InventoryAllocationModel,
                 ReservationItemModel.product_id,
                 InventoryProviderModel,
+                ProviderCredentialModel,
             )
             .join(
                 ReservationItemModel,
@@ -397,8 +431,13 @@ class SqlAlchemyReservationRepository:
                 InventoryProviderModel,
                 InventoryProviderModel.id == InventoryAllocationModel.provider_id,
             )
+            .outerjoin(
+                ProviderCredentialModel,
+                ProviderCredentialModel.provider_id
+                == InventoryProviderModel.id,
+            )
             .where(ReservationItemModel.reservation_id == reservation.id)
-            .with_for_update()
+            .with_for_update(of=InventoryAllocationModel)
         )
         allocations = (await self._session.execute(allocations_statement)).all()
         inventory_repository = InventoryRepository(
@@ -413,12 +452,15 @@ class SqlAlchemyReservationRepository:
         )
         reservation.release_target_status = terminal_status
 
-        for allocation, product_id, provider in allocations:
+        for allocation, product_id, provider, credentials in allocations:
             outcome = await self._release_allocation(
                 context=release_context,
                 allocation=allocation,
                 product_id=product_id,
-                provider=provider,
+                configured_provider=_ConfiguredProvider(
+                    provider=provider,
+                    credentials=credentials,
+                ),
                 inventory_repository=inventory_repository,
             )
             if outcome is ProviderReleaseOutcome.RELEASED:
@@ -442,9 +484,10 @@ class SqlAlchemyReservationRepository:
         context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         product_id: UUID,
-        provider: InventoryProviderModel,
+        configured_provider: _ConfiguredProvider,
         inventory_repository: InventoryRepository,
     ) -> ProviderReleaseOutcome:
+        provider = configured_provider.provider
         if allocation.status is AllocationStatus.RELEASED:
             return ProviderReleaseOutcome.RELEASED
         if provider.kind is ProviderKind.EXTERNAL:
@@ -452,6 +495,7 @@ class SqlAlchemyReservationRepository:
                 context=context,
                 allocation=allocation,
                 provider=provider,
+                credentials=configured_provider.credentials,
             )
 
         released_inventory = await inventory_repository.release_hold(
@@ -469,6 +513,7 @@ class SqlAlchemyReservationRepository:
         context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         provider: InventoryProviderModel,
+        credentials: ProviderCredentialModel | None,
     ) -> ProviderReleaseOutcome:
         if (
             self._provider_registry is None
@@ -514,6 +559,7 @@ class SqlAlchemyReservationRepository:
             provider_id=provider.id,
             base_url=provider.base_url,
             timeout=provider.request_timeout_ms / 1000,
+            credentials=_to_provider_credentials(credentials),
         )
         attempt = await external_provider.release(
             ReleaseCommand(
@@ -575,9 +621,10 @@ class SqlAlchemyReservationRepository:
         context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         product_id: UUID,
-        provider: InventoryProviderModel,
+        configured_provider: _ConfiguredProvider,
         inventory_repository: InventoryRepository,
     ) -> ProviderConfirmOutcome:
+        provider = configured_provider.provider
         if allocation.status is AllocationStatus.CONFIRMED:
             return ProviderConfirmOutcome.CONFIRMED
         if provider.kind is ProviderKind.EXTERNAL:
@@ -585,6 +632,7 @@ class SqlAlchemyReservationRepository:
                 context=context,
                 allocation=allocation,
                 provider=provider,
+                credentials=configured_provider.credentials,
             )
 
         confirmed_inventory = await inventory_repository.confirm_hold(
@@ -602,6 +650,7 @@ class SqlAlchemyReservationRepository:
         context: _ProviderOperationContext,
         allocation: InventoryAllocationModel,
         provider: InventoryProviderModel,
+        credentials: ProviderCredentialModel | None,
     ) -> ProviderConfirmOutcome:
         if (
             self._provider_registry is None
@@ -647,6 +696,7 @@ class SqlAlchemyReservationRepository:
             provider_id=provider.id,
             base_url=provider.base_url,
             timeout=provider.request_timeout_ms / 1000,
+            credentials=_to_provider_credentials(credentials),
         )
         attempt = await external_provider.confirm(
             ConfirmCommand(

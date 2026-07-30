@@ -345,3 +345,107 @@ async def test_internal_provider_rejects_external_credentials() -> None:
             ),
         }
     }
+
+
+async def test_basic_credentials_require_public_username() -> None:
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name="basic-without-username",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://basic-without-username.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderCredentialRepository(provider)
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+    app.add_exception_handler(
+        InvalidProviderConfigurationError,
+        handle_invalid_provider_configuration,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.put(
+            f"/internal/v1/providers/{provider_id}/credentials",
+            json={
+                "auth_type": "basic",
+                "secret_ref": "env://BASIC_PROVIDER_PASSWORD",
+                "public_config": {},
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "invalid_provider_configuration",
+            "message": (
+                "Basic authentication requires a non-blank public username."
+            ),
+        }
+    }
+
+
+async def test_credentials_cannot_overwrite_idempotency_header() -> None:
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name="reserved-auth-header",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://reserved-auth-header.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderCredentialRepository(provider)
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+    app.add_exception_handler(
+        InvalidProviderConfigurationError,
+        handle_invalid_provider_configuration,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.put(
+            f"/internal/v1/providers/{provider_id}/credentials",
+            json={
+                "auth_type": "api_key",
+                "secret_ref": "env://PROVIDER_API_KEY",
+                "public_config": {
+                    "header_name": "Idempotency-Key",
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "invalid_provider_configuration",
+            "message": (
+                "Credential header must not overwrite Idempotency-Key."
+            ),
+        }
+    }

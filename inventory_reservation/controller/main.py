@@ -25,7 +25,10 @@ from inventory_reservation.controller.reservation import (
     handle_reservation_not_found,
 )
 from inventory_reservation.repository.database import Database
-from inventory_reservation.repository.provider import ProviderRegistry
+from inventory_reservation.repository.provider import (
+    EnvironmentSecretResolver,
+    ProviderRegistry,
+)
 from inventory_reservation.repository.provider_management import (
     SqlAlchemyProviderRepository,
 )
@@ -119,6 +122,7 @@ def build_app(
     http_client = provider_http_client if provider_http_client is not None else httpx.AsyncClient()
     provider_registry = ProviderRegistry(
         client=http_client,
+        secret_resolver=EnvironmentSecretResolver(),
         failure_threshold=int(
             os.getenv(
                 "PROVIDER_FAILURE_THRESHOLD",

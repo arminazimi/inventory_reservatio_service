@@ -84,6 +84,32 @@ Its behavior is configurable with `RECONCILIATION_BATCH_SIZE`,
 `RECONCILIATION_RETRY_BASE_DELAY_SECONDS`. The metrics listener can be changed
 with `RECONCILIATION_METRICS_HOST` and `RECONCILIATION_METRICS_PORT`.
 
+## Provider credentials
+
+Provider credential configuration stores only a reference to secret material.
+The default resolver reads references in the form `env://VARIABLE_NAME` when a
+hold, confirmation, or release request is sent:
+
+```bash
+export ACME_PROVIDER_TOKEN="replace-with-runtime-secret"
+```
+
+```json
+{
+  "auth_type": "bearer",
+  "secret_ref": "env://ACME_PROVIDER_TOKEN",
+  "public_config": {
+    "header_name": "Authorization",
+    "scheme": "Bearer"
+  }
+}
+```
+
+Send that document with
+`PUT /internal/v1/providers/{provider_id}/credentials`. API Key, Bearer,
+Basic, OAuth2, and unauthenticated providers are supported. The secret value
+is resolved for each provider operation and is never stored in PostgreSQL.
+
 Stop the local services without deleting database data:
 
 ```bash

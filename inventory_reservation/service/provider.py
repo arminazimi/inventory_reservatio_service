@@ -139,6 +139,14 @@ class InventoryProvider(HoldProvider, ConfirmProvider, ReleaseProvider, Protocol
     pass
 
 
+class SecretResolver(Protocol):
+    async def resolve(self, secret_ref: str) -> str: ...
+
+
+class SecretResolutionError(RuntimeError):
+    pass
+
+
 class ProviderCallFailedError(RuntimeError):
     def __init__(self, provider_id: UUID) -> None:
         self.provider_id = provider_id

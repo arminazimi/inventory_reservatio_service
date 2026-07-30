@@ -8,7 +8,10 @@ import structlog
 from prometheus_client import CollectorRegistry, start_http_server
 
 from inventory_reservation.repository.database import Database
-from inventory_reservation.repository.provider import ProviderRegistry
+from inventory_reservation.repository.provider import (
+    EnvironmentSecretResolver,
+    ProviderRegistry,
+)
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.repository.telemetry import (
     PrometheusExpirationWorkerObserver,
@@ -64,6 +67,7 @@ async def run_expiration_worker() -> ExpirationWorkerRunSummary:
         )
         provider_registry = ProviderRegistry(
             client=http_client,
+            secret_resolver=EnvironmentSecretResolver(),
             failure_threshold=int(
                 os.getenv(
                     "PROVIDER_FAILURE_THRESHOLD",

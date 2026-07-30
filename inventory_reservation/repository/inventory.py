@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from inventory_reservation.repository.models import (
     InventoryLevelModel,
     InventoryProviderModel,
+    ProviderCredentialModel,
     ProviderKind,
 )
 from inventory_reservation.repository.provider import ProviderRegistry
@@ -16,6 +17,10 @@ from inventory_reservation.service.provider import (
     ProviderHold,
     ProviderHoldAttempt,
     ProviderRouter,
+)
+from inventory_reservation.service.provider_management import (
+    ProviderAuthType,
+    ProviderCredentialConfiguration,
 )
 
 
@@ -173,11 +178,19 @@ class InventoryRepository:
         idempotency_key: str,
     ) -> ProviderHold | None:
         candidates_statement = (
-            select(InventoryProviderModel)
+            select(
+                InventoryProviderModel,
+                ProviderCredentialModel,
+            )
             .select_from(InventoryLevelModel)
             .join(
                 InventoryProviderModel,
                 InventoryProviderModel.id == InventoryLevelModel.provider_id,
+            )
+            .outerjoin(
+                ProviderCredentialModel,
+                ProviderCredentialModel.provider_id
+                == InventoryProviderModel.id,
             )
             .where(
                 InventoryLevelModel.product_id == product_id,
@@ -189,13 +202,21 @@ class InventoryRepository:
                 InventoryLevelModel.provider_id,
             )
         )
-        candidates = (await self._session.scalars(candidates_statement)).all()
+        candidates = (
+            await self._session.execute(candidates_statement)
+        ).all()
 
         router = ProviderRouter(
             tuple(
                 provider
-                for candidate in candidates
-                if (provider := self._hold_provider(candidate)) is not None
+                for candidate, credentials in candidates
+                if (
+                    provider := self._hold_provider(
+                        candidate,
+                        credentials,
+                    )
+                )
+                is not None
             )
         )
         return await router.hold(
@@ -209,6 +230,7 @@ class InventoryRepository:
     def _hold_provider(
         self,
         candidate: InventoryProviderModel,
+        credentials: ProviderCredentialModel | None,
     ) -> HoldProvider | None:
         if candidate.kind is ProviderKind.INTERNAL:
             return _InternalInventoryProvider(
@@ -224,6 +246,18 @@ class InventoryRepository:
                 provider_id=candidate.id,
                 base_url=candidate.base_url,
                 timeout=candidate.request_timeout_ms / 1000,
+                credentials=(
+                    ProviderCredentialConfiguration(
+                        provider_id=credentials.provider_id,
+                        auth_type=ProviderAuthType(
+                            credentials.auth_type.value
+                        ),
+                        secret_ref=credentials.secret_ref,
+                        public_config=credentials.public_config,
+                    )
+                    if credentials is not None
+                    else None
+                ),
             )
         return None
 

@@ -242,8 +242,12 @@ that failure semantics—not just HTTP wiring—were designed.
   providing better B-tree locality than UUIDv4. A high-volume append-only table
   could later use `BIGINT` internally if measurements justify it.
 - **Secret references, not provider secrets.** The schema stores provider
-  authentication type and a `secret_ref`; resolving real credentials from a
-  secret manager is deployment infrastructure outside this implementation.
+  authentication type and a `secret_ref`. A service-layer `SecretResolver`
+  port isolates credential lookup, while the default infrastructure adapter
+  resolves `env://VARIABLE_NAME` references at call time. This keeps rotation
+  independent of database writes and prevents raw secrets from entering
+  PostgreSQL. Production deployments can replace the adapter with Vault or a
+  cloud secret manager without changing checkout behavior.
 - **No generic provider framework.** A typed HTTP adapter covers the working
   contract. New protocols should be added when a real second contract exists,
   not pre-designed speculatively.
@@ -296,8 +300,8 @@ Other follow-up work, in order, would be:
 3. add readiness/liveness endpoints, OpenTelemetry traces across SQL and
    provider calls, API latency/error metrics, and Sentry-style exception
    capture;
-4. implement a real secret-manager credential resolver and provider-specific
-   authentication adapters;
+4. implement Vault or cloud-secret-manager resolver adapters with caching,
+   rotation notifications, and resolver health metrics;
 5. run contract, load, and fault-injection tests to tune batch sizes,
    connection pools, circuit thresholds, timeouts, and retry budgets from
    evidence;

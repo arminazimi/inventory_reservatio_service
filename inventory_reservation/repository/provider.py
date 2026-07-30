@@ -1,3 +1,6 @@
+import os
+from base64 import b64encode
+from collections.abc import Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -14,6 +17,12 @@ from inventory_reservation.service.provider import (
     ProviderHoldAttempt,
     ProviderReleaseAttempt,
     ReleaseCommand,
+    SecretResolutionError,
+    SecretResolver,
+)
+from inventory_reservation.service.provider_management import (
+    ProviderAuthType,
+    ProviderCredentialConfiguration,
 )
 
 
@@ -21,6 +30,36 @@ class _HoldResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hold_reference: str
+
+
+class EnvironmentSecretResolver:
+    """Resolve env:// references without exposing secret values to configuration."""
+
+    def __init__(
+        self,
+        *,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        self._environ = os.environ if environ is None else environ
+
+    async def resolve(self, secret_ref: str) -> str:
+        scheme, separator, variable_name = secret_ref.partition("://")
+        if (
+            separator != "://"
+            or scheme != "env"
+            or not variable_name
+        ):
+            raise SecretResolutionError
+        secret = self._environ.get(variable_name)
+        if not secret:
+            raise SecretResolutionError
+        return secret
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAuthentication:
+    credentials: ProviderCredentialConfiguration
+    secret_resolver: SecretResolver | None
 
 
 class HttpInventoryProvider:
@@ -33,17 +72,19 @@ class HttpInventoryProvider:
         base_url: str,
         timeout: float,
         client: httpx.AsyncClient,
+        authentication: ProviderAuthentication | None = None,
     ) -> None:
         self.provider_id = provider_id
         self._hold_url = f"{base_url.rstrip('/')}/holds"
         self._timeout = timeout
         self._client = client
+        self._authentication = authentication
 
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
         try:
             response = await self._client.post(
                 self._hold_url,
-                headers={"Idempotency-Key": command.idempotency_key},
+                headers=await self._request_headers(command.idempotency_key),
                 json={
                     "product_id": str(command.product_id),
                     "quantity": command.quantity,
@@ -62,11 +103,85 @@ class HttpInventoryProvider:
         payload = _HoldResponse.model_validate(response.json())
         return ProviderHoldAttempt.held(reference=payload.hold_reference)
 
+    async def _request_headers(
+        self,
+        idempotency_key: str,
+    ) -> dict[str, str]:
+        headers = {"Idempotency-Key": idempotency_key}
+        authentication = self._authentication
+        credentials = (
+            authentication.credentials
+            if authentication is not None
+            else None
+        )
+        if (
+            credentials is None
+            or credentials.auth_type is ProviderAuthType.NONE
+        ):
+            return headers
+        if (
+            authentication is None
+            or authentication.secret_resolver is None
+            or credentials.secret_ref is None
+        ):
+            raise ProviderCallFailedError(self.provider_id)
+
+        try:
+            secret = await authentication.secret_resolver.resolve(
+                credentials.secret_ref
+            )
+        except SecretResolutionError:
+            raise ProviderCallFailedError(self.provider_id) from None
+        header_name = credentials.public_config.get(
+            "header_name",
+            (
+                "X-API-Key"
+                if credentials.auth_type is ProviderAuthType.API_KEY
+                else "Authorization"
+            ),
+        )
+        if (
+            not isinstance(header_name, str)
+            or not header_name.strip()
+            or header_name.casefold() == "idempotency-key"
+        ):
+            raise ProviderCallFailedError(self.provider_id)
+
+        if credentials.auth_type is ProviderAuthType.API_KEY:
+            headers[header_name] = secret
+            return headers
+        if credentials.auth_type is ProviderAuthType.BASIC:
+            username = credentials.public_config.get("username")
+            if (
+                not isinstance(username, str)
+                or not username.strip()
+                or ":" in username
+            ):
+                raise ProviderCallFailedError(self.provider_id)
+            encoded_credentials = b64encode(
+                f"{username}:{secret}".encode()
+            ).decode()
+            headers[header_name] = f"Basic {encoded_credentials}"
+            return headers
+        if credentials.auth_type not in {
+            ProviderAuthType.BEARER,
+            ProviderAuthType.OAUTH2,
+        }:
+            raise ProviderCallFailedError(self.provider_id)
+
+        scheme = credentials.public_config.get("scheme", "Bearer")
+        if not isinstance(scheme, str):
+            raise ProviderCallFailedError(self.provider_id)
+        headers[header_name] = f"{scheme} {secret}"
+        return headers
+
     async def confirm(self, command: ConfirmCommand) -> ProviderConfirmAttempt:
         try:
             response = await self._client.post(
                 f"{self._hold_url}/{command.hold_reference}/confirm",
-                headers={"Idempotency-Key": command.idempotency_key},
+                headers=await self._request_headers(
+                    command.idempotency_key
+                ),
                 timeout=self._timeout,
             )
         except httpx.TimeoutException:
@@ -87,7 +202,9 @@ class HttpInventoryProvider:
         try:
             response = await self._client.post(
                 f"{self._hold_url}/{command.hold_reference}/release",
-                headers={"Idempotency-Key": command.idempotency_key},
+                headers=await self._request_headers(
+                    command.idempotency_key
+                ),
                 timeout=self._timeout,
             )
         except httpx.TimeoutException:
@@ -106,6 +223,7 @@ class HttpInventoryProvider:
 class _ExternalProviderSettings:
     base_url: str
     timeout: float
+    credentials: ProviderCredentialConfiguration | None
 
 
 class ProviderRegistry:
@@ -115,10 +233,12 @@ class ProviderRegistry:
         self,
         *,
         client: httpx.AsyncClient,
+        secret_resolver: SecretResolver | None = None,
         failure_threshold: int = 3,
         recovery_timeout: float = 30.0,
     ) -> None:
         self._client = client
+        self._secret_resolver = secret_resolver
         self._failure_threshold = failure_threshold
         self._recovery_timeout = recovery_timeout
         self._providers: dict[
@@ -132,10 +252,12 @@ class ProviderRegistry:
         provider_id: UUID,
         base_url: str,
         timeout: float,
+        credentials: ProviderCredentialConfiguration | None = None,
     ) -> InventoryProvider:
         settings = _ExternalProviderSettings(
             base_url=base_url,
             timeout=timeout,
+            credentials=credentials,
         )
         registered = self._providers.get(provider_id)
         if registered is not None and registered[0] == settings:
@@ -147,6 +269,14 @@ class ProviderRegistry:
                 base_url=base_url,
                 timeout=timeout,
                 client=self._client,
+                authentication=(
+                    ProviderAuthentication(
+                        credentials=credentials,
+                        secret_resolver=self._secret_resolver,
+                    )
+                    if credentials is not None
+                    else None
+                ),
             ),
             failure_threshold=self._failure_threshold,
             recovery_timeout=self._recovery_timeout,

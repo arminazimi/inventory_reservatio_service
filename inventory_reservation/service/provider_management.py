@@ -288,6 +288,26 @@ class ProviderManagementService:
             raise InvalidProviderConfigurationError(
                 "Public credential config must not contain secret values."
             )
+        if command.auth_type is ProviderAuthType.BASIC:
+            username = command.public_config.get("username")
+            if (
+                not isinstance(username, str)
+                or not username.strip()
+                or ":" in username
+            ):
+                raise InvalidProviderConfigurationError(
+                    "Basic authentication requires a non-blank public username."
+                )
+        header_name = command.public_config.get("header_name")
+        if header_name is not None:
+            if not isinstance(header_name, str) or not header_name.strip():
+                raise InvalidProviderConfigurationError(
+                    "Credential header name must be a non-blank string."
+                )
+            if header_name.casefold() == "idempotency-key":
+                raise InvalidProviderConfigurationError(
+                    "Credential header must not overwrite Idempotency-Key."
+                )
         credentials = ProviderCredentialConfiguration(
             provider_id=provider_id,
             auth_type=command.auth_type,

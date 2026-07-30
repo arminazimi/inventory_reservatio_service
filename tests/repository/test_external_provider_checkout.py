@@ -18,6 +18,8 @@ from inventory_reservation.repository.models import (
     InventoryProviderModel,
     OrderModel,
     ProductModel,
+    ProviderAuthType,
+    ProviderCredentialModel,
     ProviderKind,
     ProviderOperationModel,
     ProviderOperationStatus,
@@ -25,7 +27,10 @@ from inventory_reservation.repository.models import (
     ReservationItemModel,
     ReservationModel,
 )
-from inventory_reservation.repository.provider import ProviderRegistry
+from inventory_reservation.repository.provider import (
+    EnvironmentSecretResolver,
+    ProviderRegistry,
+)
 from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.reservation import (
     ReconciliationWorkerConfig,
@@ -360,9 +365,13 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
     )
     external_requests = 0
 
-    async def external_provider_api(_: httpx.Request) -> httpx.Response:
+    async def external_provider_api(request: httpx.Request) -> httpx.Response:
         nonlocal external_requests
         external_requests += 1
+        assert (
+            request.headers["Authorization"]
+            == "Bearer checkout-provider-token"
+        )
         return httpx.Response(
             status_code=201,
             json={"hold_reference": "external-checkout-hold"},
@@ -372,7 +381,14 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(external_provider_api)
         ) as client:
-            provider_registry = ProviderRegistry(client=client)
+            provider_registry = ProviderRegistry(
+                client=client,
+                secret_resolver=EnvironmentSecretResolver(
+                    environ={
+                        "CHECKOUT_PROVIDER_TOKEN": "checkout-provider-token",
+                    }
+                ),
+            )
 
             async with database.session() as session, session.begin():
                 unique_suffix = uuid7().hex
@@ -401,6 +417,12 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
                 internal_provider_id = internal_provider.id
                 session.add_all(
                     [
+                        ProviderCredentialModel(
+                            provider_id=external_provider_id,
+                            auth_type=ProviderAuthType.BEARER,
+                            secret_ref="env://CHECKOUT_PROVIDER_TOKEN",
+                            public_config={},
+                        ),
                         InventoryLevelModel(
                             product_id=product_id,
                             provider_id=external_provider_id,
@@ -492,6 +514,10 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
     requests: list[tuple[str, str, str]] = []
 
     async def external_provider_api(request: httpx.Request) -> httpx.Response:
+        assert (
+            request.headers["Authorization"]
+            == "Bearer confirmation-provider-token"
+        )
         requests.append(
             (
                 request.method,
@@ -510,7 +536,16 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(external_provider_api)
         ) as client:
-            provider_registry = ProviderRegistry(client=client)
+            provider_registry = ProviderRegistry(
+                client=client,
+                secret_resolver=EnvironmentSecretResolver(
+                    environ={
+                        "CONFIRMATION_PROVIDER_TOKEN": (
+                            "confirmation-provider-token"
+                        ),
+                    }
+                ),
+            )
 
             async with database.session() as session, session.begin():
                 unique_suffix = uuid7().hex
@@ -531,13 +566,21 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                 await session.flush()
                 product_id = product.id
                 provider_id = provider.id
-                session.add(
-                    InventoryLevelModel(
-                        product_id=product_id,
-                        provider_id=provider_id,
-                        on_hand=0,
-                        reserved=0,
-                    )
+                session.add_all(
+                    [
+                        ProviderCredentialModel(
+                            provider_id=provider_id,
+                            auth_type=ProviderAuthType.BEARER,
+                            secret_ref="env://CONFIRMATION_PROVIDER_TOKEN",
+                            public_config={},
+                        ),
+                        InventoryLevelModel(
+                            product_id=product_id,
+                            provider_id=provider_id,
+                            on_hand=0,
+                            reserved=0,
+                        ),
+                    ]
                 )
 
             service = ReservationService(
@@ -766,6 +809,10 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
     requests: list[tuple[str, str, str]] = []
 
     async def external_provider_api(request: httpx.Request) -> httpx.Response:
+        assert (
+            request.headers["Authorization"]
+            == "Bearer release-provider-token"
+        )
         requests.append(
             (
                 request.method,
@@ -784,7 +831,14 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(external_provider_api)
         ) as client:
-            provider_registry = ProviderRegistry(client=client)
+            provider_registry = ProviderRegistry(
+                client=client,
+                secret_resolver=EnvironmentSecretResolver(
+                    environ={
+                        "RELEASE_PROVIDER_TOKEN": "release-provider-token",
+                    }
+                ),
+            )
 
             async with database.session() as session, session.begin():
                 unique_suffix = uuid7().hex
@@ -805,13 +859,21 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
                 await session.flush()
                 product_id = product.id
                 provider_id = provider.id
-                session.add(
-                    InventoryLevelModel(
-                        product_id=product_id,
-                        provider_id=provider_id,
-                        on_hand=0,
-                        reserved=0,
-                    )
+                session.add_all(
+                    [
+                        ProviderCredentialModel(
+                            provider_id=provider_id,
+                            auth_type=ProviderAuthType.BEARER,
+                            secret_ref="env://RELEASE_PROVIDER_TOKEN",
+                            public_config={},
+                        ),
+                        InventoryLevelModel(
+                            product_id=product_id,
+                            provider_id=provider_id,
+                            on_hand=0,
+                            reserved=0,
+                        ),
+                    ]
                 )
 
             service = ReservationService(
