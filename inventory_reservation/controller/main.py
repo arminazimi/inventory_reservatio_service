@@ -8,6 +8,10 @@ import httpx
 from fastapi import FastAPI
 from starlette.types import Lifespan
 
+from inventory_reservation.controller.inventory_management import (
+    create_inventory_management_router,
+    handle_inventory_below_reserved,
+)
 from inventory_reservation.controller.product import (
     create_product_router,
     handle_invalid_product_configuration,
@@ -31,6 +35,9 @@ from inventory_reservation.controller.reservation import (
     handle_reservation_not_found,
 )
 from inventory_reservation.repository.database import Database
+from inventory_reservation.repository.inventory_management import (
+    SqlAlchemyInventoryLevelRepository,
+)
 from inventory_reservation.repository.product import (
     SqlAlchemyProductRepository,
 )
@@ -42,6 +49,10 @@ from inventory_reservation.repository.provider_management import (
     SqlAlchemyProviderRepository,
 )
 from inventory_reservation.repository.reservation import reservation_transaction
+from inventory_reservation.service.inventory_management import (
+    InventoryBelowReservedError,
+    InventoryManagementService,
+)
 from inventory_reservation.service.product import (
     InvalidProductConfigurationError,
     ProductManagementService,
@@ -77,6 +88,7 @@ class UtcClock:
 def create_app(
     *,
     reservation_service: ReservationService,
+    inventory_management_service: InventoryManagementService | None = None,
     provider_management_service: ProviderManagementService | None = None,
     product_management_service: ProductManagementService | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
@@ -87,6 +99,12 @@ def create_app(
         lifespan=lifespan,
     )
     app.include_router(create_reservation_router(reservation_service))
+    if inventory_management_service is not None:
+        app.include_router(
+            create_inventory_management_router(
+                inventory_management_service
+            )
+        )
     if provider_management_service is not None:
         app.include_router(
             create_provider_router(provider_management_service)
@@ -95,6 +113,10 @@ def create_app(
         app.include_router(
             create_product_router(product_management_service)
         )
+    app.add_exception_handler(
+        InventoryBelowReservedError,
+        handle_inventory_below_reserved,
+    )
     app.add_exception_handler(
         InvalidProductConfigurationError,
         handle_invalid_product_configuration,
@@ -187,6 +209,9 @@ def build_app(
     provider_management_service = ProviderManagementService(
         repository=SqlAlchemyProviderRepository(database),
     )
+    inventory_management_service = InventoryManagementService(
+        repository=SqlAlchemyInventoryLevelRepository(database),
+    )
     product_management_service = ProductManagementService(
         repository=SqlAlchemyProductRepository(database),
     )
@@ -203,6 +228,7 @@ def build_app(
 
     return create_app(
         reservation_service=reservation_service,
+        inventory_management_service=inventory_management_service,
         provider_management_service=provider_management_service,
         product_management_service=product_management_service,
         lifespan=lifespan,
