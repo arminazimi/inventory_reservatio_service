@@ -2,18 +2,21 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Path, Request, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import JSONResponse
 
 from inventory_reservation.service.provider_management import (
     InvalidProviderConfigurationError,
+    ProviderAuthType,
     ProviderCapabilities,
     ProviderConfiguration,
+    ProviderCredentialConfiguration,
     ProviderKind,
     ProviderManagementService,
     ProviderNameConflictError,
     ProviderNotFoundError,
     RegisterProviderCommand,
+    SetProviderCredentialsCommand,
     UpdateProviderCommand,
 )
 
@@ -45,6 +48,14 @@ class UpdateProviderRequest(BaseModel):
     base_url: str | None = None
     request_timeout_ms: int | None = None
     capabilities: ProviderCapabilitiesRequest | None = None
+
+
+class SetProviderCredentialsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    auth_type: ProviderAuthType
+    secret_ref: str | None = None
+    public_config: dict[str, object] = Field(default_factory=dict)
 
 
 class ProviderCapabilitiesResponse(BaseModel):
@@ -89,6 +100,25 @@ class ProviderResponse(BaseModel):
                 provider.capabilities
             ),
             is_enabled=provider.is_enabled,
+        )
+
+
+class ProviderCredentialsResponse(BaseModel):
+    provider_id: UUID
+    auth_type: ProviderAuthType
+    secret_ref: str | None
+    public_config: dict[str, object]
+
+    @classmethod
+    def from_domain(
+        cls,
+        credentials: ProviderCredentialConfiguration,
+    ) -> ProviderCredentialsResponse:
+        return cls(
+            provider_id=credentials.provider_id,
+            auth_type=credentials.auth_type,
+            secret_ref=credentials.secret_ref,
+            public_config=credentials.public_config,
         )
 
 
@@ -299,5 +329,32 @@ def create_provider_router(
     ) -> ProviderResponse:
         provider = await provider_management.disable_provider(provider_id)
         return ProviderResponse.from_domain(provider)
+
+    @router.put(
+        "/{provider_id}/credentials",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ProviderErrorResponse,
+                "description": "Provider was not found.",
+            },
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
+                "model": ProviderErrorResponse,
+                "description": "Credential configuration violates domain rules.",
+            },
+        },
+    )
+    async def set_provider_credentials(
+        provider_id: Annotated[UUID, Path()],
+        request: SetProviderCredentialsRequest,
+    ) -> ProviderCredentialsResponse:
+        credentials = await provider_management.set_provider_credentials(
+            provider_id,
+            SetProviderCredentialsCommand(
+                auth_type=request.auth_type,
+                secret_ref=request.secret_ref,
+                public_config=request.public_config,
+            ),
+        )
+        return ProviderCredentialsResponse.from_domain(credentials)
 
     return router

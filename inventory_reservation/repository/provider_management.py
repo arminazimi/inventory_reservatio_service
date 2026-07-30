@@ -1,18 +1,25 @@
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.models import (
     InventoryProviderModel,
+    ProviderCredentialModel,
+)
+from inventory_reservation.repository.models import (
+    ProviderAuthType as ProviderAuthTypeModel,
 )
 from inventory_reservation.repository.models import (
     ProviderKind as ProviderKindModel,
 )
 from inventory_reservation.service.provider_management import (
+    ProviderAuthType,
     ProviderCapabilities,
     ProviderConfiguration,
+    ProviderCredentialConfiguration,
     ProviderKind,
     ProviderNameConflictError,
 )
@@ -109,6 +116,46 @@ class SqlAlchemyProviderRepository:
             return None
         return self._to_domain(provider)
 
+    async def upsert_credentials(
+        self,
+        credentials: ProviderCredentialConfiguration,
+    ) -> ProviderCredentialConfiguration:
+        insert_statement = insert(ProviderCredentialModel).values(
+            provider_id=credentials.provider_id,
+            auth_type=ProviderAuthTypeModel(credentials.auth_type.value),
+            secret_ref=credentials.secret_ref,
+            public_config=credentials.public_config,
+        )
+        statement = insert_statement.on_conflict_do_update(
+            index_elements=[ProviderCredentialModel.provider_id],
+            set_={
+                "auth_type": insert_statement.excluded.auth_type,
+                "secret_ref": insert_statement.excluded.secret_ref,
+                "public_config": insert_statement.excluded.public_config,
+                "updated_at": func.now(),
+            },
+        ).returning(ProviderCredentialModel)
+        async with self._database.session() as session, session.begin():
+            credential_model = (await session.scalars(statement)).one()
+
+        return self._credentials_to_domain(credential_model)
+
+    async def get_credentials(
+        self,
+        provider_id: UUID,
+    ) -> ProviderCredentialConfiguration | None:
+        statement = select(ProviderCredentialModel).where(
+            ProviderCredentialModel.provider_id == provider_id
+        )
+        async with self._database.session() as session:
+            credential_model = (
+                await session.scalars(statement)
+            ).one_or_none()
+
+        if credential_model is None:
+            return None
+        return self._credentials_to_domain(credential_model)
+
     @staticmethod
     def _to_model(provider: ProviderConfiguration) -> InventoryProviderModel:
         return InventoryProviderModel(
@@ -141,6 +188,17 @@ class SqlAlchemyProviderRepository:
                 release=provider.supports_release,
             ),
             is_enabled=provider.is_enabled,
+        )
+
+    @staticmethod
+    def _credentials_to_domain(
+        credentials: ProviderCredentialModel,
+    ) -> ProviderCredentialConfiguration:
+        return ProviderCredentialConfiguration(
+            provider_id=credentials.provider_id,
+            auth_type=ProviderAuthType(credentials.auth_type.value),
+            secret_ref=credentials.secret_ref,
+            public_config=credentials.public_config,
         )
 
 

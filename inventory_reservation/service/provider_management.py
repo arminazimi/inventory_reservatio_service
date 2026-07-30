@@ -1,14 +1,35 @@
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 from urllib.parse import urlsplit
 from uuid import UUID, uuid7
 
+SENSITIVE_PUBLIC_CONFIG_KEYS = frozenset(
+    {
+        "api_key",
+        "access_token",
+        "authorization",
+        "client_secret",
+        "password",
+        "refresh_token",
+        "secret",
+        "token",
+    }
+)
+
 
 class ProviderKind(StrEnum):
     INTERNAL = "internal"
     EXTERNAL = "external"
+
+
+class ProviderAuthType(StrEnum):
+    NONE = "none"
+    API_KEY = "api_key"
+    BEARER = "bearer"
+    BASIC = "basic"
+    OAUTH2 = "oauth2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +70,21 @@ class UpdateProviderCommand:
     capabilities: ProviderCapabilities | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SetProviderCredentialsCommand:
+    auth_type: ProviderAuthType
+    secret_ref: str | None
+    public_config: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCredentialConfiguration:
+    provider_id: UUID
+    auth_type: ProviderAuthType
+    secret_ref: str | None
+    public_config: dict[str, object]
+
+
 class ProviderRepositoryPort(Protocol):
     async def list(self) -> tuple[ProviderConfiguration, ...]: ...
 
@@ -67,6 +103,16 @@ class ProviderRepositoryPort(Protocol):
         *,
         is_enabled: bool,
     ) -> ProviderConfiguration | None: ...
+
+    async def upsert_credentials(
+        self,
+        credentials: ProviderCredentialConfiguration,
+    ) -> ProviderCredentialConfiguration: ...
+
+    async def get_credentials(
+        self,
+        provider_id: UUID,
+    ) -> ProviderCredentialConfiguration | None: ...
 
 
 class ProviderNotFoundError(LookupError):
@@ -200,6 +246,72 @@ class ProviderManagementService:
         if disabled_provider is None:
             raise ProviderNotFoundError(provider_id)
         return disabled_provider
+
+    async def set_provider_credentials(
+        self,
+        provider_id: UUID,
+        command: SetProviderCredentialsCommand,
+    ) -> ProviderCredentialConfiguration:
+        provider = await self.get_provider(provider_id)
+        if (
+            provider.kind is ProviderKind.INTERNAL
+            and command.auth_type is not ProviderAuthType.NONE
+        ):
+            raise InvalidProviderConfigurationError(
+                "Internal provider does not support external credentials."
+            )
+        if (
+            command.auth_type is not ProviderAuthType.NONE
+            and (
+                command.secret_ref is None
+                or not command.secret_ref.strip()
+            )
+        ):
+            raise InvalidProviderConfigurationError(
+                "Authenticated provider requires a non-blank secret reference."
+            )
+        if (
+            command.secret_ref is not None
+            and len(command.secret_ref) > 255
+        ):
+            raise InvalidProviderConfigurationError(
+                "Secret reference must not exceed 255 characters."
+            )
+        if (
+            command.auth_type is ProviderAuthType.NONE
+            and command.secret_ref is not None
+        ):
+            raise InvalidProviderConfigurationError(
+                "Unauthenticated provider must not define a secret reference."
+            )
+        if _contains_sensitive_public_config(command.public_config):
+            raise InvalidProviderConfigurationError(
+                "Public credential config must not contain secret values."
+            )
+        credentials = ProviderCredentialConfiguration(
+            provider_id=provider_id,
+            auth_type=command.auth_type,
+            secret_ref=command.secret_ref,
+            public_config=command.public_config,
+        )
+        return await self._repository.upsert_credentials(credentials)
+
+
+def _contains_sensitive_public_config(value: object) -> bool:
+    if isinstance(value, Mapping):
+        for key, nested_value in value.items():
+            normalized_key = str(key).strip().lower().replace("-", "_")
+            if normalized_key in SENSITIVE_PUBLIC_CONFIG_KEYS:
+                return True
+            if _contains_sensitive_public_config(nested_value):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(
+            _contains_sensitive_public_config(item)
+            for item in value
+        )
+    return False
 
 
 def _validate_provider_configuration(
