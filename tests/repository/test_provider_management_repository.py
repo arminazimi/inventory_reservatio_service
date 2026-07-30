@@ -325,3 +325,62 @@ async def test_repository_updates_provider_configuration() -> None:
                 )
             )
         await database.close()
+
+
+@pytest.mark.integration
+async def test_repository_changes_provider_routing_status() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name=f"provider-enable-{provider_id.hex}",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://provider-enable.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+
+    try:
+        repository = SqlAlchemyProviderRepository(database)
+        await repository.add(provider)
+
+        enabled_provider = await repository.set_enabled(
+            provider_id,
+            is_enabled=True,
+        )
+
+        assert enabled_provider == ProviderConfiguration(
+            id=provider_id,
+            name=f"provider-enable-{provider_id.hex}",
+            kind=ProviderKind.EXTERNAL,
+            driver="http",
+            base_url="https://provider-enable.test",
+            request_timeout_ms=1_000,
+            capabilities=ProviderCapabilities(
+                availability=True,
+                hold=True,
+                confirm=True,
+                release=True,
+            ),
+            is_enabled=True,
+        )
+    finally:
+        async with database.session() as session, session.begin():
+            await session.execute(
+                delete(InventoryProviderModel).where(
+                    InventoryProviderModel.id == provider_id
+                )
+            )
+        await database.close()

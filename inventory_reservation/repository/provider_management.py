@@ -90,6 +90,25 @@ class SqlAlchemyProviderRepository:
 
         return updated_provider_id is not None
 
+    async def set_enabled(
+        self,
+        provider_id: UUID,
+        *,
+        is_enabled: bool,
+    ) -> ProviderConfiguration | None:
+        statement = (
+            update(InventoryProviderModel)
+            .where(InventoryProviderModel.id == provider_id)
+            .values(is_enabled=is_enabled)
+            .returning(InventoryProviderModel)
+        )
+        async with self._database.session() as session, session.begin():
+            provider = (await session.scalars(statement)).one_or_none()
+
+        if provider is None:
+            return None
+        return self._to_domain(provider)
+
     @staticmethod
     def _to_model(provider: ProviderConfiguration) -> InventoryProviderModel:
         return InventoryProviderModel(

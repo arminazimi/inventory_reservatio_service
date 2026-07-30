@@ -61,6 +61,13 @@ class ProviderRepositoryPort(Protocol):
 
     async def update(self, provider: ProviderConfiguration) -> bool: ...
 
+    async def set_enabled(
+        self,
+        provider_id: UUID,
+        *,
+        is_enabled: bool,
+    ) -> ProviderConfiguration | None: ...
+
 
 class ProviderNotFoundError(LookupError):
     def __init__(self, provider_id: UUID) -> None:
@@ -161,6 +168,39 @@ class ProviderManagementService:
             raise ProviderNotFoundError(provider_id)
         return updated
 
+    async def enable_provider(
+        self,
+        provider_id: UUID,
+    ) -> ProviderConfiguration:
+        provider = await self.get_provider(provider_id)
+        if provider.is_enabled:
+            return provider
+
+        _validate_provider_configuration(provider)
+        enabled_provider = await self._repository.set_enabled(
+            provider_id,
+            is_enabled=True,
+        )
+        if enabled_provider is None:
+            raise ProviderNotFoundError(provider_id)
+        return enabled_provider
+
+    async def disable_provider(
+        self,
+        provider_id: UUID,
+    ) -> ProviderConfiguration:
+        provider = await self.get_provider(provider_id)
+        if not provider.is_enabled:
+            return provider
+
+        disabled_provider = await self._repository.set_enabled(
+            provider_id,
+            is_enabled=False,
+        )
+        if disabled_provider is None:
+            raise ProviderNotFoundError(provider_id)
+        return disabled_provider
+
 
 def _validate_provider_configuration(
     provider: ProviderConfiguration,
@@ -179,6 +219,13 @@ def _validate_provider_configuration(
     ):
         raise InvalidProviderConfigurationError(
             "Internal provider must not define a base URL."
+        )
+    if (
+        provider.kind is ProviderKind.INTERNAL
+        and provider.driver != "internal"
+    ):
+        raise InvalidProviderConfigurationError(
+            "Internal provider driver must be 'internal'."
         )
     if provider.kind is ProviderKind.EXTERNAL and not provider.base_url:
         raise InvalidProviderConfigurationError(

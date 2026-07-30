@@ -1,3 +1,4 @@
+from dataclasses import replace
 from uuid import UUID, uuid7
 
 from fastapi import FastAPI
@@ -51,6 +52,19 @@ class InMemoryProviderRepository:
                 self._providers[index] = provider
                 return True
         return False
+
+    async def set_enabled(
+        self,
+        provider_id: UUID,
+        *,
+        is_enabled: bool,
+    ) -> ProviderConfiguration | None:
+        for index, provider in enumerate(self._providers):
+            if provider.id == provider_id:
+                updated = replace(provider, is_enabled=is_enabled)
+                self._providers[index] = updated
+                return updated
+        return None
 
 
 async def test_operator_can_list_provider_configurations() -> None:
@@ -678,5 +692,147 @@ async def test_update_internal_provider_rejects_base_url() -> None:
         "error": {
             "code": "invalid_provider_configuration",
             "message": "Internal provider must not define a base URL.",
+        }
+    }
+
+
+async def test_operator_can_enable_provider() -> None:
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name="provider-to-enable",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://provider-to-enable.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderRepository((provider,))
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            f"/internal/v1/providers/{provider_id}/enable"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": str(provider_id),
+        "name": "provider-to-enable",
+        "kind": "external",
+        "driver": "http",
+        "base_url": "https://provider-to-enable.test",
+        "request_timeout_ms": 1_000,
+        "capabilities": {
+            "availability": True,
+            "hold": True,
+            "confirm": True,
+            "release": True,
+        },
+        "is_enabled": True,
+    }
+
+
+async def test_operator_can_disable_provider() -> None:
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name="provider-to-disable",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://provider-to-disable.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=True,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderRepository((provider,))
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            f"/internal/v1/providers/{provider_id}/disable"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": str(provider_id),
+        "name": "provider-to-disable",
+        "kind": "external",
+        "driver": "http",
+        "base_url": "https://provider-to-disable.test",
+        "request_timeout_ms": 1_000,
+        "capabilities": {
+            "availability": True,
+            "hold": True,
+            "confirm": True,
+            "release": True,
+        },
+        "is_enabled": False,
+    }
+
+
+async def test_enable_rejects_invalid_internal_provider_driver() -> None:
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name="invalid-internal-provider",
+        kind=ProviderKind.INTERNAL,
+        driver="http",
+        base_url=None,
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderRepository((provider,))
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+    app.add_exception_handler(
+        InvalidProviderConfigurationError,
+        handle_invalid_provider_configuration,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            f"/internal/v1/providers/{provider_id}/enable"
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "invalid_provider_configuration",
+            "message": "Internal provider driver must be 'internal'.",
         }
     }

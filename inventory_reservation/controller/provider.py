@@ -266,4 +266,38 @@ def create_provider_router(
         )
         return ProviderResponse.from_domain(provider)
 
+    @router.post(
+        "/{provider_id}/enable",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ProviderErrorResponse,
+                "description": "Provider was not found.",
+            },
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
+                "model": ProviderErrorResponse,
+                "description": "Provider configuration violates domain rules.",
+            },
+        },
+    )
+    async def enable_provider(
+        provider_id: Annotated[UUID, Path()],
+    ) -> ProviderResponse:
+        provider = await provider_management.enable_provider(provider_id)
+        return ProviderResponse.from_domain(provider)
+
+    @router.post(
+        "/{provider_id}/disable",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ProviderErrorResponse,
+                "description": "Provider was not found.",
+            }
+        },
+    )
+    async def disable_provider(
+        provider_id: Annotated[UUID, Path()],
+    ) -> ProviderResponse:
+        provider = await provider_management.disable_provider(provider_id)
+        return ProviderResponse.from_domain(provider)
+
     return router
