@@ -35,7 +35,7 @@ class Database:
             async with self._engine.connect() as connection:
                 result = await connection.execute(text("SELECT 1"))
                 return cast(int, result.scalar_one()) == 1
-        except SQLAlchemyError:
+        except (OSError, SQLAlchemyError):
             return False
 
     async def close(self) -> None:

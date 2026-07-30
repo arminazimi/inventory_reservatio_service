@@ -1,7 +1,9 @@
+from time import monotonic
 from typing import cast
 
 import structlog
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from structlog.typing import FilteringBoundLogger
 
 from inventory_reservation.service.reservation import (
@@ -14,6 +16,70 @@ from inventory_reservation.service.reservation import (
     ReconciliationBatchSucceeded,
     ReconciliationWorkerObserver,
 )
+
+
+class PrometheusHttpMetrics:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        registry: CollectorRegistry,
+    ) -> None:
+        self._app = app
+        self._requests = Counter(
+            "inventory_reservation_http_requests_total",
+            "HTTP requests processed by route and response status.",
+            ("method", "route", "status"),
+            registry=registry,
+        )
+        self._request_duration = Histogram(
+            "inventory_reservation_http_request_duration_seconds",
+            "HTTP request duration by method and route.",
+            ("method", "route"),
+            registry=registry,
+        )
+        self._in_progress = Gauge(
+            "inventory_reservation_http_requests_in_progress",
+            "HTTP requests currently being processed by method.",
+            ("method",),
+            registry=registry,
+        )
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http" or scope["path"] == "/metrics":
+            await self._app(scope, receive, send)
+            return
+
+        method = scope["method"]
+        status_code = 500
+        started_at = monotonic()
+        self._in_progress.labels(method=method).inc()
+
+        async def send_with_status(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        try:
+            await self._app(scope, receive, send_with_status)
+        finally:
+            route = cast(str, getattr(scope.get("route"), "path", "unmatched"))
+            self._in_progress.labels(method=method).dec()
+            self._requests.labels(
+                method=method,
+                route=route,
+                status=str(status_code),
+            ).inc()
+            self._request_duration.labels(
+                method=method,
+                route=route,
+            ).observe(monotonic() - started_at)
 
 
 class PrometheusExpirationWorkerObserver(ExpirationWorkerObserver):

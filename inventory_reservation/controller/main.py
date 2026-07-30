@@ -6,6 +6,7 @@ from uuid import uuid7
 
 import httpx
 from fastapi import FastAPI
+from prometheus_client import CollectorRegistry
 from starlette.types import Lifespan
 
 from inventory_reservation.controller.inventory_management import (
@@ -13,6 +14,9 @@ from inventory_reservation.controller.inventory_management import (
     handle_inventory_below_reserved,
     handle_inventory_has_active_reservations,
     handle_inventory_level_not_found,
+)
+from inventory_reservation.controller.operations import (
+    create_operations_router,
 )
 from inventory_reservation.controller.product import (
     create_product_router,
@@ -51,6 +55,7 @@ from inventory_reservation.repository.provider_management import (
     SqlAlchemyProviderRepository,
 )
 from inventory_reservation.repository.reservation import reservation_transaction
+from inventory_reservation.repository.telemetry import PrometheusHttpMetrics
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
     InventoryHasActiveReservationsError,
@@ -185,6 +190,7 @@ def build_app(
     provider_http_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     database = Database(os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL))
+    metrics_registry = CollectorRegistry()
     http_client = provider_http_client if provider_http_client is not None else httpx.AsyncClient()
     provider_registry = ProviderRegistry(
         client=http_client,
@@ -238,13 +244,24 @@ def build_app(
             finally:
                 await database.close()
 
-    return create_app(
+    app = create_app(
         reservation_service=reservation_service,
         inventory_management_service=inventory_management_service,
         provider_management_service=provider_management_service,
         product_management_service=product_management_service,
         lifespan=lifespan,
     )
+    app.include_router(
+        create_operations_router(
+            database_is_ready=database.is_ready,
+            metrics_registry=metrics_registry,
+        )
+    )
+    app.add_middleware(
+        PrometheusHttpMetrics,
+        registry=metrics_registry,
+    )
+    return app
 
 
 app = build_app()

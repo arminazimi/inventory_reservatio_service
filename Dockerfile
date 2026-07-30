@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY inventory_reservation ./inventory_reservation
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-editable
+    uv sync --locked --no-editable --reinstall-package ir
 
 
 FROM python:3.14-slim-trixie AS runtime
