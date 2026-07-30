@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from inventory_reservation.repository.database import Database
@@ -59,6 +59,36 @@ class SqlAlchemyProviderRepository:
             ):
                 raise ProviderNameConflictError(provider.name) from error
             raise
+
+    async def update(self, provider: ProviderConfiguration) -> bool:
+        statement = (
+            update(InventoryProviderModel)
+            .where(InventoryProviderModel.id == provider.id)
+            .values(
+                name=provider.name,
+                base_url=provider.base_url,
+                request_timeout_ms=provider.request_timeout_ms,
+                supports_availability=provider.capabilities.availability,
+                supports_hold=provider.capabilities.hold,
+                supports_confirm=provider.capabilities.confirm,
+                supports_release=provider.capabilities.release,
+            )
+            .returning(InventoryProviderModel.id)
+        )
+        try:
+            async with self._database.session() as session, session.begin():
+                updated_provider_id = (
+                    await session.scalars(statement)
+                ).one_or_none()
+        except IntegrityError as error:
+            if _violates_constraint(
+                error,
+                PROVIDER_NAME_CONSTRAINT,
+            ):
+                raise ProviderNameConflictError(provider.name) from error
+            raise
+
+        return updated_provider_id is not None
 
     @staticmethod
     def _to_model(provider: ProviderConfiguration) -> InventoryProviderModel:

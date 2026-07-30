@@ -14,6 +14,7 @@ from inventory_reservation.service.provider_management import (
     ProviderNameConflictError,
     ProviderNotFoundError,
     RegisterProviderCommand,
+    UpdateProviderCommand,
 )
 
 
@@ -35,6 +36,15 @@ class RegisterProviderRequest(BaseModel):
     base_url: str | None = None
     request_timeout_ms: int
     capabilities: ProviderCapabilitiesRequest
+
+
+class UpdateProviderRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    base_url: str | None = None
+    request_timeout_ms: int | None = None
+    capabilities: ProviderCapabilitiesRequest | None = None
 
 
 class ProviderCapabilitiesResponse(BaseModel):
@@ -212,6 +222,48 @@ def create_provider_router(
         provider_id: Annotated[UUID, Path()],
     ) -> ProviderResponse:
         provider = await provider_management.get_provider(provider_id)
+        return ProviderResponse.from_domain(provider)
+
+    @router.patch(
+        "/{provider_id}",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ProviderErrorResponse,
+                "description": "Provider was not found.",
+            },
+            status.HTTP_409_CONFLICT: {
+                "model": ProviderErrorResponse,
+                "description": "Provider name is already registered.",
+            },
+            status.HTTP_422_UNPROCESSABLE_CONTENT: {
+                "model": ProviderErrorResponse,
+                "description": "Provider configuration violates domain rules.",
+            },
+        },
+    )
+    async def update_provider(
+        provider_id: Annotated[UUID, Path()],
+        request: UpdateProviderRequest,
+    ) -> ProviderResponse:
+        capabilities = (
+            ProviderCapabilities(
+                availability=request.capabilities.availability,
+                hold=request.capabilities.hold,
+                confirm=request.capabilities.confirm,
+                release=request.capabilities.release,
+            )
+            if request.capabilities is not None
+            else None
+        )
+        provider = await provider_management.update_provider(
+            provider_id,
+            UpdateProviderCommand(
+                name=request.name,
+                base_url=request.base_url,
+                request_timeout_ms=request.request_timeout_ms,
+                capabilities=capabilities,
+            ),
+        )
         return ProviderResponse.from_domain(provider)
 
     return router

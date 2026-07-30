@@ -268,3 +268,60 @@ async def test_repository_maps_duplicate_provider_name_to_domain_conflict() -> N
                 )
             )
         await database.close()
+
+
+@pytest.mark.integration
+async def test_repository_updates_provider_configuration() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    provider_id = uuid7()
+    original_provider = ProviderConfiguration(
+        id=provider_id,
+        name=f"provider-update-before-{provider_id.hex}",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://provider-update-before.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    updated_provider = ProviderConfiguration(
+        id=provider_id,
+        name=f"provider-update-after-{provider_id.hex}",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://provider-update-after.test",
+        request_timeout_ms=2_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=False,
+            confirm=False,
+            release=False,
+        ),
+        is_enabled=False,
+    )
+
+    try:
+        repository = SqlAlchemyProviderRepository(database)
+        await repository.add(original_provider)
+
+        await repository.update(updated_provider)
+
+        assert await repository.get(provider_id) == updated_provider
+    finally:
+        async with database.session() as session, session.begin():
+            await session.execute(
+                delete(InventoryProviderModel).where(
+                    InventoryProviderModel.id == provider_id
+                )
+            )
+        await database.close()

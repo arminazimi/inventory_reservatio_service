@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -41,6 +41,14 @@ class RegisterProviderCommand:
     capabilities: ProviderCapabilities
 
 
+@dataclass(frozen=True, slots=True)
+class UpdateProviderCommand:
+    name: str | None = None
+    base_url: str | None = None
+    request_timeout_ms: int | None = None
+    capabilities: ProviderCapabilities | None = None
+
+
 class ProviderRepositoryPort(Protocol):
     async def list(self) -> tuple[ProviderConfiguration, ...]: ...
 
@@ -50,6 +58,8 @@ class ProviderRepositoryPort(Protocol):
     ) -> ProviderConfiguration | None: ...
 
     async def add(self, provider: ProviderConfiguration) -> None: ...
+
+    async def update(self, provider: ProviderConfiguration) -> bool: ...
 
 
 class ProviderNotFoundError(LookupError):
@@ -94,45 +104,6 @@ class ProviderManagementService:
         self,
         command: RegisterProviderCommand,
     ) -> ProviderConfiguration:
-        if not command.name.strip():
-            raise InvalidProviderConfigurationError(
-                "Provider name must not be blank."
-            )
-        if command.request_timeout_ms <= 0:
-            raise InvalidProviderConfigurationError(
-                "Provider request timeout must be positive."
-            )
-        if (
-            command.kind is ProviderKind.EXTERNAL
-            and not command.base_url
-        ):
-            raise InvalidProviderConfigurationError(
-                "External provider requires a base URL."
-            )
-        if (
-            command.kind is ProviderKind.EXTERNAL
-            and command.driver != "http"
-        ):
-            raise InvalidProviderConfigurationError(
-                "External provider driver must be 'http'."
-            )
-        if command.kind is ProviderKind.EXTERNAL:
-            parsed_base_url = urlsplit(command.base_url)
-            if (
-                parsed_base_url.scheme not in {"http", "https"}
-                or not parsed_base_url.netloc
-            ):
-                raise InvalidProviderConfigurationError(
-                    "External provider base URL must use HTTP or HTTPS."
-                )
-        if command.capabilities.hold and not (
-            command.capabilities.confirm
-            and command.capabilities.release
-        ):
-            raise InvalidProviderConfigurationError(
-                "Hold-capable provider must support confirm and release."
-            )
-
         provider = ProviderConfiguration(
             id=self._provider_id_factory(),
             name=command.name,
@@ -143,5 +114,96 @@ class ProviderManagementService:
             capabilities=command.capabilities,
             is_enabled=False,
         )
+        _validate_provider_configuration(provider)
         await self._repository.add(provider)
         return provider
+
+    async def update_provider(
+        self,
+        provider_id: UUID,
+        command: UpdateProviderCommand,
+    ) -> ProviderConfiguration:
+        if all(
+            value is None
+            for value in (
+                command.name,
+                command.base_url,
+                command.request_timeout_ms,
+                command.capabilities,
+            )
+        ):
+            raise InvalidProviderConfigurationError(
+                "Provider update must include at least one mutable field."
+            )
+
+        current = await self.get_provider(provider_id)
+        updated = replace(
+            current,
+            name=command.name if command.name is not None else current.name,
+            base_url=(
+                command.base_url
+                if command.base_url is not None
+                else current.base_url
+            ),
+            request_timeout_ms=(
+                command.request_timeout_ms
+                if command.request_timeout_ms is not None
+                else current.request_timeout_ms
+            ),
+            capabilities=(
+                command.capabilities
+                if command.capabilities is not None
+                else current.capabilities
+            ),
+        )
+        _validate_provider_configuration(updated)
+        if not await self._repository.update(updated):
+            raise ProviderNotFoundError(provider_id)
+        return updated
+
+
+def _validate_provider_configuration(
+    provider: ProviderConfiguration,
+) -> None:
+    if not provider.name.strip():
+        raise InvalidProviderConfigurationError(
+            "Provider name must not be blank."
+        )
+    if provider.request_timeout_ms <= 0:
+        raise InvalidProviderConfigurationError(
+            "Provider request timeout must be positive."
+        )
+    if (
+        provider.kind is ProviderKind.INTERNAL
+        and provider.base_url is not None
+    ):
+        raise InvalidProviderConfigurationError(
+            "Internal provider must not define a base URL."
+        )
+    if provider.kind is ProviderKind.EXTERNAL and not provider.base_url:
+        raise InvalidProviderConfigurationError(
+            "External provider requires a base URL."
+        )
+    if (
+        provider.kind is ProviderKind.EXTERNAL
+        and provider.driver != "http"
+    ):
+        raise InvalidProviderConfigurationError(
+            "External provider driver must be 'http'."
+        )
+    if provider.kind is ProviderKind.EXTERNAL:
+        parsed_base_url = urlsplit(provider.base_url)
+        if (
+            parsed_base_url.scheme not in {"http", "https"}
+            or not parsed_base_url.netloc
+        ):
+            raise InvalidProviderConfigurationError(
+                "External provider base URL must use HTTP or HTTPS."
+            )
+    if provider.capabilities.hold and not (
+        provider.capabilities.confirm
+        and provider.capabilities.release
+    ):
+        raise InvalidProviderConfigurationError(
+            "Hold-capable provider must support confirm and release."
+        )

@@ -45,6 +45,13 @@ class InMemoryProviderRepository:
             raise ProviderNameConflictError(provider.name)
         self._providers.append(provider)
 
+    async def update(self, provider: ProviderConfiguration) -> bool:
+        for index, existing in enumerate(self._providers):
+            if existing.id == provider.id:
+                self._providers[index] = provider
+                return True
+        return False
+
 
 async def test_operator_can_list_provider_configurations() -> None:
     provider_id = uuid7()
@@ -519,5 +526,157 @@ async def test_register_external_provider_requires_http_base_url() -> None:
         "error": {
             "code": "invalid_provider_configuration",
             "message": "External provider base URL must use HTTP or HTTPS.",
+        }
+    }
+
+
+async def test_operator_can_update_provider_configuration() -> None:
+    provider_id = uuid7()
+    existing_provider = ProviderConfiguration(
+        id=provider_id,
+        name="marketplace-before-update",
+        kind=ProviderKind.EXTERNAL,
+        driver="http",
+        base_url="https://before-update.test",
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderRepository((existing_provider,))
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.patch(
+            f"/internal/v1/providers/{provider_id}",
+            json={
+                "name": "marketplace-after-update",
+                "base_url": "https://after-update.test",
+                "request_timeout_ms": 2_500,
+                "capabilities": {
+                    "availability": True,
+                    "hold": False,
+                    "confirm": False,
+                    "release": False,
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": str(provider_id),
+        "name": "marketplace-after-update",
+        "kind": "external",
+        "driver": "http",
+        "base_url": "https://after-update.test",
+        "request_timeout_ms": 2_500,
+        "capabilities": {
+            "availability": True,
+            "hold": False,
+            "confirm": False,
+            "release": False,
+        },
+        "is_enabled": False,
+    }
+
+
+async def test_update_provider_rejects_empty_patch() -> None:
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name="provider-empty-patch",
+        kind=ProviderKind.INTERNAL,
+        driver="internal",
+        base_url=None,
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderRepository((provider,))
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+    app.add_exception_handler(
+        InvalidProviderConfigurationError,
+        handle_invalid_provider_configuration,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.patch(
+            f"/internal/v1/providers/{provider_id}",
+            json={},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "invalid_provider_configuration",
+            "message": (
+                "Provider update must include at least one mutable field."
+            ),
+        }
+    }
+
+
+async def test_update_internal_provider_rejects_base_url() -> None:
+    provider_id = uuid7()
+    provider = ProviderConfiguration(
+        id=provider_id,
+        name="internal-provider",
+        kind=ProviderKind.INTERNAL,
+        driver="internal",
+        base_url=None,
+        request_timeout_ms=1_000,
+        capabilities=ProviderCapabilities(
+            availability=True,
+            hold=True,
+            confirm=True,
+            release=True,
+        ),
+        is_enabled=False,
+    )
+    service = ProviderManagementService(
+        repository=InMemoryProviderRepository((provider,))
+    )
+    app = FastAPI()
+    app.include_router(create_provider_router(service))
+    app.add_exception_handler(
+        InvalidProviderConfigurationError,
+        handle_invalid_provider_configuration,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.patch(
+            f"/internal/v1/providers/{provider_id}",
+            json={"base_url": "https://internal-provider.test"},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "invalid_provider_configuration",
+            "message": "Internal provider must not define a base URL.",
         }
     }
