@@ -9,6 +9,7 @@ from inventory_reservation.service.product import (
     InvalidProductConfigurationError,
     Product,
     ProductManagementService,
+    ProductNotFoundError,
     ProductSkuConflictError,
 )
 
@@ -40,6 +41,7 @@ class ProductErrorDetail(BaseModel):
     code: str
     message: str
     sku: str | None = None
+    product_id: UUID | None = None
 
 
 class ProductErrorResponse(BaseModel):
@@ -85,6 +87,26 @@ async def handle_product_sku_conflict(
     )
 
 
+async def handle_product_not_found(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, ProductNotFoundError):
+        raise error
+
+    response = ProductErrorResponse(
+        error=ProductErrorDetail(
+            code="product_not_found",
+            message="Product was not found.",
+            product_id=error.product_id,
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=response.model_dump(mode="json", exclude_none=True),
+    )
+
+
 def create_product_router(
     product_management: ProductManagementService,
 ) -> APIRouter:
@@ -92,6 +114,27 @@ def create_product_router(
         prefix="/internal/v1/products",
         tags=["internal products"],
     )
+
+    @router.get("")
+    async def list_products() -> list[ProductResponse]:
+        products = await product_management.list_products()
+        return [
+            ProductResponse.from_domain(product)
+            for product in products
+        ]
+
+    @router.get(
+        "/{product_id}",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": ProductErrorResponse,
+                "description": "Product was not found.",
+            }
+        },
+    )
+    async def get_product(product_id: UUID) -> ProductResponse:
+        product = await product_management.get_product(product_id)
+        return ProductResponse.from_domain(product)
 
     @router.post(
         "",

@@ -23,6 +23,8 @@ class ProductRepositoryPort(Protocol):
 
     async def get(self, product_id: UUID) -> Product | None: ...
 
+    async def list(self) -> tuple[Product, ...]: ...
+
 
 class InvalidProductConfigurationError(ValueError):
     pass
@@ -32,6 +34,12 @@ class ProductSkuConflictError(ValueError):
     def __init__(self, sku: str) -> None:
         self.sku = sku
         super().__init__(f"Product SKU {sku!r} is already in use")
+
+
+class ProductNotFoundError(LookupError):
+    def __init__(self, product_id: UUID) -> None:
+        self.product_id = product_id
+        super().__init__(f"Product {product_id} was not found")
 
 
 class ProductManagementService:
@@ -73,4 +81,13 @@ class ProductManagementService:
             is_active=True,
         )
         await self._repository.add(product)
+        return product
+
+    async def list_products(self) -> tuple[Product, ...]:
+        return await self._repository.list()
+
+    async def get_product(self, product_id: UUID) -> Product:
+        product = await self._repository.get(product_id)
+        if product is None:
+            raise ProductNotFoundError(product_id)
         return product

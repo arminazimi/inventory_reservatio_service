@@ -42,6 +42,20 @@ class SqlAlchemyProductRepository:
 
         if product is None:
             return None
+        return self._to_domain(product)
+
+    async def list(self) -> tuple[Product, ...]:
+        statement = select(ProductModel).order_by(
+            ProductModel.sku,
+            ProductModel.id,
+        )
+        async with self._database.session() as session:
+            products = (await session.scalars(statement)).all()
+
+        return tuple(self._to_domain(product) for product in products)
+
+    @staticmethod
+    def _to_domain(product: ProductModel) -> Product:
         return Product(
             id=product.id,
             sku=product.sku,

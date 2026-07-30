@@ -11,6 +11,7 @@ from starlette.types import Lifespan
 from inventory_reservation.controller.product import (
     create_product_router,
     handle_invalid_product_configuration,
+    handle_product_not_found,
     handle_product_sku_conflict,
 )
 from inventory_reservation.controller.provider import (
@@ -44,6 +45,7 @@ from inventory_reservation.repository.reservation import reservation_transaction
 from inventory_reservation.service.product import (
     InvalidProductConfigurationError,
     ProductManagementService,
+    ProductNotFoundError,
     ProductSkuConflictError,
 )
 from inventory_reservation.service.provider_management import (
@@ -100,6 +102,10 @@ def create_app(
     app.add_exception_handler(
         ProductSkuConflictError,
         handle_product_sku_conflict,
+    )
+    app.add_exception_handler(
+        ProductNotFoundError,
+        handle_product_not_found,
     )
     app.add_exception_handler(
         ProviderNotFoundError,
