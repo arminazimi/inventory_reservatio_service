@@ -1,3 +1,8 @@
+x-app-image: &app-image
+  build:
+    context: .
+  image: inventory-reservation:local
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -21,6 +26,105 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  migrate:
+    <<: *app-image
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://inventory:inventory@postgres:5432/inventory
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app-image
+    command:
+      [
+        "uvicorn",
+        "inventory_reservation.controller.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://inventory:inventory@postgres:5432/inventory
+      RESERVATION_TTL_SECONDS: ${RESERVATION_TTL_SECONDS:-900}
+      PROVIDER_FAILURE_THRESHOLD: ${PROVIDER_FAILURE_THRESHOLD:-3}
+      PROVIDER_RECOVERY_TIMEOUT_SECONDS: ${PROVIDER_RECOVERY_TIMEOUT_SECONDS:-30}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    init: true
+    restart: unless-stopped
+
+  expiration-worker:
+    <<: *app-image
+    command: ["reservation-expiration-worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://inventory:inventory@postgres:5432/inventory
+      EXPIRATION_BATCH_SIZE: ${EXPIRATION_BATCH_SIZE:-100}
+      EXPIRATION_POLL_INTERVAL_SECONDS: ${EXPIRATION_POLL_INTERVAL_SECONDS:-5}
+      EXPIRATION_METRICS_HOST: 0.0.0.0
+      EXPIRATION_METRICS_PORT: 9101
+      PROVIDER_FAILURE_THRESHOLD: ${PROVIDER_FAILURE_THRESHOLD:-3}
+      PROVIDER_RECOVERY_TIMEOUT_SECONDS: ${PROVIDER_RECOVERY_TIMEOUT_SECONDS:-30}
+    ports:
+      - "${EXPIRATION_METRICS_PORT:-9101}:9101"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:9101/metrics', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    init: true
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+  reconciliation-worker:
+    <<: *app-image
+    command: ["reservation-reconciliation-worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://inventory:inventory@postgres:5432/inventory
+      RECONCILIATION_BATCH_SIZE: ${RECONCILIATION_BATCH_SIZE:-100}
+      RECONCILIATION_MAX_ATTEMPTS: ${RECONCILIATION_MAX_ATTEMPTS:-3}
+      RECONCILIATION_POLL_INTERVAL_SECONDS: ${RECONCILIATION_POLL_INTERVAL_SECONDS:-5}
+      RECONCILIATION_RETRY_BASE_DELAY_SECONDS: ${RECONCILIATION_RETRY_BASE_DELAY_SECONDS:-30}
+      RECONCILIATION_METRICS_HOST: 0.0.0.0
+      RECONCILIATION_METRICS_PORT: 9102
+      PROVIDER_FAILURE_THRESHOLD: ${PROVIDER_FAILURE_THRESHOLD:-3}
+      PROVIDER_RECOVERY_TIMEOUT_SECONDS: ${PROVIDER_RECOVERY_TIMEOUT_SECONDS:-30}
+    ports:
+      - "${RECONCILIATION_METRICS_PORT:-9102}:9102"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:9102/metrics', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    init: true
+    stop_grace_period: 20s
+    restart: unless-stopped
+
 volumes:
   postgres-data:
-
