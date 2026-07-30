@@ -10,6 +10,8 @@ class:
   contracts.
 - `tests/repository`: PostgreSQL concurrency, migrations, queries, and external
   provider contracts.
+- `tests/e2e`: complete public HTTP workflows backed by PostgreSQL, including
+  checkout retries and inventory outcomes.
 
 Every implementation slice starts with one failing behavioral test. Internal
 collaborators are not mocked; only true system boundaries such as external
