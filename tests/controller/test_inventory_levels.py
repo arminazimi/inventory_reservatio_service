@@ -6,12 +6,14 @@ from httpx import ASGITransport, AsyncClient
 from inventory_reservation.controller.inventory_management import (
     create_inventory_management_router,
     handle_inventory_below_reserved,
+    handle_inventory_level_not_found,
 )
 from inventory_reservation.controller.product import handle_product_not_found
 from inventory_reservation.controller.provider import handle_provider_not_found
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
     InventoryLevel,
+    InventoryLevelNotFoundError,
     InventoryManagementService,
 )
 from inventory_reservation.service.product import ProductNotFoundError
@@ -21,6 +23,7 @@ from inventory_reservation.service.provider_management import (
 
 PRODUCT_ID = UUID("00000000-0000-7000-8000-000000000030")
 PROVIDER_ID = UUID("00000000-0000-7000-8000-000000000031")
+SECOND_PROVIDER_ID = UUID("00000000-0000-7000-8000-000000000032")
 
 
 class InMemoryInventoryLevelRepository:
@@ -34,6 +37,32 @@ class InMemoryInventoryLevelRepository:
 
     async def provider_exists(self, provider_id: UUID) -> bool:
         return provider_id in self.provider_ids
+
+    async def list_by_product(
+        self,
+        product_id: UUID,
+    ) -> tuple[InventoryLevel, ...]:
+        return tuple(
+            sorted(
+                (
+                    level
+                    for level in self.levels.values()
+                    if level.product_id == product_id
+                ),
+                key=lambda level: (
+                    level.allocation_priority,
+                    level.provider_id,
+                ),
+            )
+        )
+
+    async def get_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> InventoryLevel | None:
+        return self.levels.get((product_id, provider_id))
 
     async def set_level(
         self,
@@ -109,6 +138,128 @@ async def test_operator_can_assign_product_inventory_to_provider() -> None:
         "available": 12,
         "allocation_priority": 10,
         "version": 1,
+    }
+
+
+async def test_operator_can_list_product_inventory_by_allocation_order() -> None:
+    repository = InMemoryInventoryLevelRepository()
+    repository.provider_ids.add(SECOND_PROVIDER_ID)
+    repository.levels = {
+        (PRODUCT_ID, PROVIDER_ID): InventoryLevel(
+            product_id=PRODUCT_ID,
+            provider_id=PROVIDER_ID,
+            on_hand=12,
+            reserved=2,
+            allocation_priority=20,
+            version=3,
+        ),
+        (PRODUCT_ID, SECOND_PROVIDER_ID): InventoryLevel(
+            product_id=PRODUCT_ID,
+            provider_id=SECOND_PROVIDER_ID,
+            on_hand=8,
+            reserved=1,
+            allocation_priority=10,
+            version=2,
+        ),
+    }
+    service = InventoryManagementService(repository=repository)
+    app = FastAPI()
+    app.include_router(create_inventory_management_router(service))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/internal/v1/products/{PRODUCT_ID}/inventory"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "product_id": str(PRODUCT_ID),
+            "provider_id": str(SECOND_PROVIDER_ID),
+            "on_hand": 8,
+            "reserved": 1,
+            "available": 7,
+            "allocation_priority": 10,
+            "version": 2,
+        },
+        {
+            "product_id": str(PRODUCT_ID),
+            "provider_id": str(PROVIDER_ID),
+            "on_hand": 12,
+            "reserved": 2,
+            "available": 10,
+            "allocation_priority": 20,
+            "version": 3,
+        },
+    ]
+
+
+async def test_operator_can_get_product_provider_inventory() -> None:
+    repository = InMemoryInventoryLevelRepository()
+    repository.levels[(PRODUCT_ID, PROVIDER_ID)] = InventoryLevel(
+        product_id=PRODUCT_ID,
+        provider_id=PROVIDER_ID,
+        on_hand=12,
+        reserved=2,
+        allocation_priority=10,
+        version=3,
+    )
+    service = InventoryManagementService(repository=repository)
+    app = FastAPI()
+    app.include_router(create_inventory_management_router(service))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/internal/v1/products/{PRODUCT_ID}"
+            f"/providers/{PROVIDER_ID}/inventory"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "product_id": str(PRODUCT_ID),
+        "provider_id": str(PROVIDER_ID),
+        "on_hand": 12,
+        "reserved": 2,
+        "available": 10,
+        "allocation_priority": 10,
+        "version": 3,
+    }
+
+
+async def test_get_unassigned_product_provider_inventory_returns_not_found() -> None:
+    service = InventoryManagementService(
+        repository=InMemoryInventoryLevelRepository()
+    )
+    app = FastAPI()
+    app.include_router(create_inventory_management_router(service))
+    app.add_exception_handler(
+        InventoryLevelNotFoundError,
+        handle_inventory_level_not_found,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/internal/v1/products/{PRODUCT_ID}"
+            f"/providers/{PROVIDER_ID}/inventory"
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "code": "inventory_level_not_found",
+            "message": "Inventory level was not found.",
+            "product_id": str(PRODUCT_ID),
+            "provider_id": str(PROVIDER_ID),
+        }
     }
 
 

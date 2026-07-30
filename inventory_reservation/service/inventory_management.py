@@ -46,10 +46,37 @@ class InventoryBelowReservedError(ValueError):
         )
 
 
+class InventoryLevelNotFoundError(LookupError):
+    def __init__(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> None:
+        self.product_id = product_id
+        self.provider_id = provider_id
+        super().__init__(
+            f"Inventory level for product {product_id} "
+            f"at provider {provider_id} was not found"
+        )
+
+
 class InventoryLevelRepositoryPort(Protocol):
     async def product_exists(self, product_id: UUID) -> bool: ...
 
     async def provider_exists(self, provider_id: UUID) -> bool: ...
+
+    async def list_by_product(
+        self,
+        product_id: UUID,
+    ) -> tuple[InventoryLevel, ...]: ...
+
+    async def get_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> InventoryLevel | None: ...
 
     async def set_level(
         self,
@@ -68,6 +95,35 @@ class InventoryManagementService:
         repository: InventoryLevelRepositoryPort,
     ) -> None:
         self._repository = repository
+
+    async def list_product_inventory(
+        self,
+        product_id: UUID,
+    ) -> tuple[InventoryLevel, ...]:
+        if not await self._repository.product_exists(product_id):
+            raise ProductNotFoundError(product_id)
+        return await self._repository.list_by_product(product_id)
+
+    async def get_inventory_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> InventoryLevel:
+        if not await self._repository.product_exists(product_id):
+            raise ProductNotFoundError(product_id)
+        if not await self._repository.provider_exists(provider_id):
+            raise ProviderNotFoundError(provider_id)
+        level = await self._repository.get_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
+        if level is None:
+            raise InventoryLevelNotFoundError(
+                product_id=product_id,
+                provider_id=provider_id,
+            )
+        return level
 
     async def set_inventory_level(
         self,

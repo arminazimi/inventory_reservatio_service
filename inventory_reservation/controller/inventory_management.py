@@ -8,6 +8,7 @@ from starlette.responses import JSONResponse
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
     InventoryLevel,
+    InventoryLevelNotFoundError,
     InventoryManagementService,
     SetInventoryLevelCommand,
 )
@@ -50,7 +51,7 @@ class InventoryErrorDetail(BaseModel):
     message: str
     product_id: UUID
     provider_id: UUID
-    reserved: int
+    reserved: int | None = None
 
 
 class InventoryErrorResponse(BaseModel):
@@ -75,7 +76,28 @@ async def handle_inventory_below_reserved(
     )
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
-        content=response.model_dump(mode="json"),
+        content=response.model_dump(mode="json", exclude_none=True),
+    )
+
+
+async def handle_inventory_level_not_found(
+    _: Request,
+    error: Exception,
+) -> JSONResponse:
+    if not isinstance(error, InventoryLevelNotFoundError):
+        raise error
+
+    response = InventoryErrorResponse(
+        error=InventoryErrorDetail(
+            code="inventory_level_not_found",
+            message="Inventory level was not found.",
+            product_id=error.product_id,
+            provider_id=error.provider_id,
+        )
+    )
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=response.model_dump(mode="json", exclude_none=True),
     )
 
 
@@ -86,6 +108,37 @@ def create_inventory_management_router(
         prefix="/internal/v1/products",
         tags=["internal inventory"],
     )
+
+    @router.get("/{product_id}/inventory")
+    async def list_product_inventory(
+        product_id: Annotated[UUID, Path()],
+    ) -> list[InventoryLevelResponse]:
+        levels = await inventory_management.list_product_inventory(
+            product_id
+        )
+        return [
+            InventoryLevelResponse.from_domain(level)
+            for level in levels
+        ]
+
+    @router.get(
+        "/{product_id}/providers/{provider_id}/inventory",
+        responses={
+            status.HTTP_404_NOT_FOUND: {
+                "model": InventoryErrorResponse,
+                "description": "Inventory assignment was not found.",
+            }
+        },
+    )
+    async def get_inventory_level(
+        product_id: Annotated[UUID, Path()],
+        provider_id: Annotated[UUID, Path()],
+    ) -> InventoryLevelResponse:
+        level = await inventory_management.get_inventory_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
+        return InventoryLevelResponse.from_domain(level)
 
     @router.put(
         "/{product_id}/providers/{provider_id}/inventory",

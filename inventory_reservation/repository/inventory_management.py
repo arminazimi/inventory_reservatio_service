@@ -37,6 +37,38 @@ class SqlAlchemyInventoryLevelRepository:
         async with self._database.session() as session:
             return (await session.scalar(statement)) is not None
 
+    async def list_by_product(
+        self,
+        product_id: UUID,
+    ) -> tuple[InventoryLevel, ...]:
+        statement = (
+            select(InventoryLevelModel)
+            .where(InventoryLevelModel.product_id == product_id)
+            .order_by(
+                InventoryLevelModel.allocation_priority,
+                InventoryLevelModel.provider_id,
+            )
+        )
+        async with self._database.session() as session:
+            levels = (await session.scalars(statement)).all()
+        return tuple(self._to_domain(level) for level in levels)
+
+    async def get_level(
+        self,
+        *,
+        product_id: UUID,
+        provider_id: UUID,
+    ) -> InventoryLevel | None:
+        statement = select(InventoryLevelModel).where(
+            InventoryLevelModel.product_id == product_id,
+            InventoryLevelModel.provider_id == provider_id,
+        )
+        async with self._database.session() as session:
+            level = (await session.scalars(statement)).one_or_none()
+        if level is None:
+            return None
+        return self._to_domain(level)
+
     async def set_level(
         self,
         *,

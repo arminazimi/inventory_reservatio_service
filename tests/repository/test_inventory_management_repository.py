@@ -68,6 +68,10 @@ async def test_inventory_assignment_is_persisted_idempotently() -> None:
             on_hand=20,
             allocation_priority=5,
         )
+        retrieved_result = await repository.get_level(
+            product_id=product_id,
+            provider_id=provider_id,
+        )
 
         expected = InventoryLevel(
             product_id=product_id,
@@ -77,9 +81,22 @@ async def test_inventory_assignment_is_persisted_idempotently() -> None:
             allocation_priority=10,
             version=1,
         )
-        assert (first_result, repeated_result, updated_result) == (
+        assert (
+            first_result,
+            repeated_result,
+            updated_result,
+            retrieved_result,
+        ) == (
             expected,
             expected,
+            InventoryLevel(
+                product_id=product_id,
+                provider_id=provider_id,
+                on_hand=20,
+                reserved=0,
+                allocation_priority=5,
+                version=2,
+            ),
             InventoryLevel(
                 product_id=product_id,
                 provider_id=provider_id,
@@ -100,6 +117,106 @@ async def test_inventory_assignment_is_persisted_idempotently() -> None:
             await session.execute(
                 delete(InventoryProviderModel).where(
                     InventoryProviderModel.id == provider_id
+                )
+            )
+            await session.execute(
+                delete(ProductModel).where(ProductModel.id == product_id)
+            )
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_product_inventory_is_listed_in_allocation_order() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    unique_suffix = uuid7().hex
+    product_id = uuid7()
+    first_provider_id = uuid7()
+    second_provider_id = uuid7()
+
+    try:
+        async with database.session() as session, session.begin():
+            session.add_all(
+                (
+                    ProductModel(
+                        id=product_id,
+                        sku=f"INVENTORY-LIST-{unique_suffix}",
+                        name="Inventory list product",
+                    ),
+                    InventoryProviderModel(
+                        id=first_provider_id,
+                        name=f"inventory-list-first-{unique_suffix}",
+                        kind=ProviderKind.INTERNAL,
+                        driver="internal",
+                    ),
+                    InventoryProviderModel(
+                        id=second_provider_id,
+                        name=f"inventory-list-second-{unique_suffix}",
+                        kind=ProviderKind.INTERNAL,
+                        driver="internal",
+                    ),
+                )
+            )
+            await session.flush()
+            session.add_all(
+                (
+                    InventoryLevelModel(
+                        product_id=product_id,
+                        provider_id=first_provider_id,
+                        on_hand=12,
+                        reserved=2,
+                        allocation_priority=20,
+                        version=3,
+                    ),
+                    InventoryLevelModel(
+                        product_id=product_id,
+                        provider_id=second_provider_id,
+                        on_hand=8,
+                        reserved=1,
+                        allocation_priority=10,
+                        version=2,
+                    ),
+                )
+            )
+
+        levels = await SqlAlchemyInventoryLevelRepository(
+            database
+        ).list_by_product(product_id)
+
+        assert levels == (
+            InventoryLevel(
+                product_id=product_id,
+                provider_id=second_provider_id,
+                on_hand=8,
+                reserved=1,
+                allocation_priority=10,
+                version=2,
+            ),
+            InventoryLevel(
+                product_id=product_id,
+                provider_id=first_provider_id,
+                on_hand=12,
+                reserved=2,
+                allocation_priority=20,
+                version=3,
+            ),
+        )
+    finally:
+        async with database.session() as session, session.begin():
+            await session.execute(
+                delete(InventoryLevelModel).where(
+                    InventoryLevelModel.product_id == product_id
+                )
+            )
+            await session.execute(
+                delete(InventoryProviderModel).where(
+                    InventoryProviderModel.id.in_(
+                        (first_provider_id, second_provider_id)
+                    )
                 )
             )
             await session.execute(
