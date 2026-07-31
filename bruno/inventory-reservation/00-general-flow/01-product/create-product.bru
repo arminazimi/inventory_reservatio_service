@@ -1,0 +1,36 @@
+meta {
+  name: Create Product
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/products
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "sku": "IPHONE-17-PRO-MAX-256",
+    "name": "Apple iPhone 17 Pro Max 256GB"
+  }
+}
+
+script:post-response {
+  if (res.status === 201) {
+    bru.setVar("productId", res.body.id);
+  }
+}
+
+tests {
+  test("product is created", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.id).to.be.a("string");
+    expect(res.body.sku).to.equal("IPHONE-17-PRO-MAX-256");
+  });
+}

@@ -1,0 +1,31 @@
+meta {
+  name: Second Provider Failure Falls Back
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: external-fallback-002
+}
+body:json {
+  {
+    "items": [
+      {
+        "product_id": "{{externalProductId}}",
+        "provider_id": "{{failingProviderId}}",
+        "quantity": 1
+      }
+    ]
+  }
+}
+tests {
+  test("second checkout uses fallback", function() { expect(res.status).to.equal(201); });
+}

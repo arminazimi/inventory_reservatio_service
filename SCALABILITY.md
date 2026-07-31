@@ -19,11 +19,11 @@ The important workload dimensions are:
 - retention period for reservations, allocations, and provider operations.
 
 The write cost of a checkout grows roughly linearly with its item count. Each
-item requires provider selection, a hold, and an allocation row. External
-provider attempts are currently sequential because the service stops as soon
-as one item's outcome is unknown. Confirmation and release likewise touch each
-allocation. The most meaningful capacity tests must therefore include item
-count and provider latency, not only single-item request throughput.
+item requires a selected-offer lookup, a hold, and an allocation row. External
+provider calls for multiple items are currently sequential. Confirmation and
+release likewise touch each allocation. The most meaningful capacity tests
+must therefore include item count and provider latency, not only single-item
+request throughput.
 
 ## How the Current Design Scales
 
@@ -51,7 +51,7 @@ Indexes support the dominant operational access paths:
 
 - reservation expiration by `(status, expires_at)`;
 - provider retries by `(status, next_attempt_at)`;
-- provider selection by `(product_id, allocation_priority)`;
+- selected-offer lookup by unique `(product_id, provider_id)`;
 - user reservation history by `(user_id, created_at)`.
 
 PostgreSQL remains one consistency boundary for internal inventory, reservation
@@ -89,7 +89,7 @@ capacity domains: provider latency consumes database concurrency.
 ### 2. Hot-product write contention
 
 All internal holds for one product/provider pair update the same
-`inventory_levels` row. The guarded update prevents overselling, but PostgreSQL
+`product_offers` row. The guarded update prevents overselling, but PostgreSQL
 must serialize those writes. Overall traffic may be moderate while a flash-sale
 SKU experiences high lock wait and low throughput.
 
@@ -195,11 +195,12 @@ they should not share one undifferentiated concurrency budget.
 
 The current design already provides:
 
-- capability-aware routing;
-- deterministic allocation priority;
-- per-process circuit breakers;
+- explicit caller-selected product offers;
+- capability checks for the selected provider;
+- opt-in fallback restricted to an explicit product-offer routing group;
+- per-process, per-operation circuit breakers;
 - explicit timeouts;
-- no blind failover after an unknown outcome;
+- no fallback to unrelated sellers and no fallback after unknown hold outcomes;
 - durable confirmation/release retry with exponential backoff.
 
 The next isolation controls should be added per provider:

@@ -67,7 +67,7 @@ def reservation() -> Reservation:
     return Reservation(
         id=uuid7(),
         user_id=uuid7(),
-        items=(ReservationItem(product_id=uuid7(), quantity=1),),
+        items=(ReservationItem(provider_id=uuid7(), product_id=uuid7(), quantity=1),),
         idempotency_key=f"expiration-{uuid7()}",
         request_fingerprint="known-fingerprint",
         created_at=FIXED_NOW - timedelta(minutes=16),

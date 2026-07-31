@@ -1,0 +1,15 @@
+meta {
+  name: Enable Failing Provider
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/providers/{{failingProviderId}}/enable
+  body: none
+  auth: none
+}
+
+tests {
+  test("failing provider enabled", function() { expect(res.status).to.equal(200); });
+}

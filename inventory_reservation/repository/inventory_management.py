@@ -5,9 +5,9 @@ from sqlalchemy.dialects.postgresql import insert
 
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.models import (
-    InventoryLevelModel,
     InventoryProviderModel,
     ProductModel,
+    ProductOfferModel,
 )
 from inventory_reservation.service.inventory_management import (
     InventoryBelowReservedError,
@@ -21,11 +21,7 @@ class SqlAlchemyInventoryLevelRepository:
         self._database = database
 
     async def product_exists(self, product_id: UUID) -> bool:
-        statement = (
-            select(ProductModel.id)
-            .where(ProductModel.id == product_id)
-            .limit(1)
-        )
+        statement = select(ProductModel.id).where(ProductModel.id == product_id).limit(1)
         async with self._database.session() as session:
             return (await session.scalar(statement)) is not None
 
@@ -43,11 +39,11 @@ class SqlAlchemyInventoryLevelRepository:
         product_id: UUID,
     ) -> tuple[InventoryLevel, ...]:
         statement = (
-            select(InventoryLevelModel)
-            .where(InventoryLevelModel.product_id == product_id)
+            select(ProductOfferModel)
+            .where(ProductOfferModel.product_id == product_id)
             .order_by(
-                InventoryLevelModel.allocation_priority,
-                InventoryLevelModel.provider_id,
+                ProductOfferModel.allocation_priority,
+                ProductOfferModel.provider_id,
             )
         )
         async with self._database.session() as session:
@@ -60,9 +56,9 @@ class SqlAlchemyInventoryLevelRepository:
         product_id: UUID,
         provider_id: UUID,
     ) -> InventoryLevel | None:
-        statement = select(InventoryLevelModel).where(
-            InventoryLevelModel.product_id == product_id,
-            InventoryLevelModel.provider_id == provider_id,
+        statement = select(ProductOfferModel).where(
+            ProductOfferModel.product_id == product_id,
+            ProductOfferModel.provider_id == provider_id,
         )
         async with self._database.session() as session:
             level = (await session.scalars(statement)).one_or_none()
@@ -77,13 +73,13 @@ class SqlAlchemyInventoryLevelRepository:
         provider_id: UUID,
     ) -> bool:
         delete_statement = (
-            delete(InventoryLevelModel)
+            delete(ProductOfferModel)
             .where(
-                InventoryLevelModel.product_id == product_id,
-                InventoryLevelModel.provider_id == provider_id,
-                InventoryLevelModel.reserved == 0,
+                ProductOfferModel.product_id == product_id,
+                ProductOfferModel.provider_id == provider_id,
+                ProductOfferModel.reserved == 0,
             )
-            .returning(InventoryLevelModel.id)
+            .returning(ProductOfferModel.id)
         )
         async with self._database.session() as session, session.begin():
             removed_id = await session.scalar(delete_statement)
@@ -92,9 +88,9 @@ class SqlAlchemyInventoryLevelRepository:
 
             current = (
                 await session.scalars(
-                    select(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id == product_id,
-                        InventoryLevelModel.provider_id == provider_id,
+                    select(ProductOfferModel).where(
+                        ProductOfferModel.product_id == product_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
             ).one_or_none()
@@ -113,53 +109,50 @@ class SqlAlchemyInventoryLevelRepository:
         provider_id: UUID,
         on_hand: int,
         allocation_priority: int,
+        routing_group: UUID | None = None,
     ) -> InventoryLevel:
-        insert_statement = insert(InventoryLevelModel).values(
+        insert_statement = insert(ProductOfferModel).values(
             id=uuid7(),
             product_id=product_id,
             provider_id=provider_id,
             on_hand=on_hand,
             reserved=0,
             allocation_priority=allocation_priority,
+            routing_group=routing_group,
             version=1,
         )
-        upsert_statement = (
-            insert_statement.on_conflict_do_update(
-                index_elements=[
-                    InventoryLevelModel.product_id,
-                    InventoryLevelModel.provider_id,
-                ],
-                set_={
-                    "on_hand": insert_statement.excluded.on_hand,
-                    "allocation_priority": (
-                        insert_statement.excluded.allocation_priority
-                    ),
-                    "version": InventoryLevelModel.version + 1,
-                },
-                where=and_(
-                    InventoryLevelModel.reserved
-                    <= insert_statement.excluded.on_hand,
-                    or_(
-                        InventoryLevelModel.on_hand
-                        != insert_statement.excluded.on_hand,
-                        InventoryLevelModel.allocation_priority
+        upsert_statement = insert_statement.on_conflict_do_update(
+            index_elements=[
+                ProductOfferModel.product_id,
+                ProductOfferModel.provider_id,
+            ],
+            set_={
+                "on_hand": insert_statement.excluded.on_hand,
+                "allocation_priority": (insert_statement.excluded.allocation_priority),
+                    "version": ProductOfferModel.version + 1,
+                    "routing_group": insert_statement.excluded.routing_group,
+            },
+            where=and_(
+                ProductOfferModel.reserved <= insert_statement.excluded.on_hand,
+                or_(
+                    ProductOfferModel.on_hand != insert_statement.excluded.on_hand,
+                        ProductOfferModel.allocation_priority
                         != insert_statement.excluded.allocation_priority,
-                    ),
+                        ProductOfferModel.routing_group.is_distinct_from(
+                            insert_statement.excluded.routing_group
+                        ),
                 ),
-            )
-            .returning(InventoryLevelModel)
-        )
+            ),
+        ).returning(ProductOfferModel)
 
         async with self._database.session() as session, session.begin():
-            level = (
-                await session.scalars(upsert_statement)
-            ).one_or_none()
+            level = (await session.scalars(upsert_statement)).one_or_none()
             if level is None:
                 level = (
                     await session.scalars(
-                        select(InventoryLevelModel).where(
-                            InventoryLevelModel.product_id == product_id,
-                            InventoryLevelModel.provider_id == provider_id,
+                        select(ProductOfferModel).where(
+                            ProductOfferModel.product_id == product_id,
+                            ProductOfferModel.provider_id == provider_id,
                         )
                     )
                 ).one()
@@ -173,7 +166,7 @@ class SqlAlchemyInventoryLevelRepository:
         return self._to_domain(level)
 
     @staticmethod
-    def _to_domain(level: InventoryLevelModel) -> InventoryLevel:
+    def _to_domain(level: ProductOfferModel) -> InventoryLevel:
         return InventoryLevel(
             product_id=level.product_id,
             provider_id=level.provider_id,
@@ -181,4 +174,5 @@ class SqlAlchemyInventoryLevelRepository:
             reserved=level.reserved,
             allocation_priority=level.allocation_priority,
             version=level.version,
+            routing_group=level.routing_group,
         )

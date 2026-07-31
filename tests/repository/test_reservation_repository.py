@@ -16,11 +16,11 @@ from inventory_reservation.repository.inventory import (
 from inventory_reservation.repository.models import (
     AllocationStatus,
     InventoryAllocationModel,
-    InventoryLevelModel,
     InventoryProviderModel,
     OrderItemModel,
     OrderModel,
     ProductModel,
+    ProductOfferModel,
     ProviderKind,
     ReservationItemModel,
     ReservationModel,
@@ -113,13 +113,25 @@ async def test_added_reservation_is_retrievable_as_domain_aggregate() -> None:
                     sku=f"RESERVATION-ROUNDTRIP-{uuid7().hex}",
                     name="Reservation round-trip test product",
                 )
-                session.add(product)
+                provider = InventoryProviderModel(
+                    name=f"reservation-roundtrip-{uuid7().hex}",
+                    kind=ProviderKind.INTERNAL,
+                    driver="internal",
+                    supports_hold=True,
+                )
+                session.add_all([product, provider])
                 await session.flush()
 
                 reservation = Reservation(
                     id=uuid7(),
                     user_id=uuid7(),
-                    items=(ReservationItem(product_id=product.id, quantity=2),),
+                    items=(
+                        ReservationItem(
+                            product_id=product.id,
+                            provider_id=provider.id,
+                            quantity=2,
+                        ),
+                    ),
                     idempotency_key="reservation-roundtrip",
                     request_fingerprint="a" * 64,
                     created_at=datetime(2026, 7, 29, 12, 0, tzinfo=UTC),
@@ -167,7 +179,7 @@ async def test_concurrent_retries_return_the_same_reservation() -> None:
             product_id = product.id
             provider_id = provider.id
             session.add(
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=product_id,
                     provider_id=provider_id,
                     on_hand=2,
@@ -185,7 +197,7 @@ async def test_concurrent_retries_return_the_same_reservation() -> None:
             reservation_id_factory=uuid7,
             ttl=timedelta(minutes=15),
         )
-        item = ReservationItem(product_id=product_id, quantity=2)
+        item = ReservationItem(product_id=product_id, provider_id=provider_id, quantity=2)
 
         try:
             reservations = await asyncio.gather(
@@ -231,9 +243,9 @@ async def test_concurrent_retries_return_the_same_reservation() -> None:
                     )
                 )
                 await session.execute(
-                    delete(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id == product_id,
-                        InventoryLevelModel.provider_id == provider_id,
+                    delete(ProductOfferModel).where(
+                        ProductOfferModel.product_id == product_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
                 await session.execute(
@@ -271,7 +283,7 @@ async def test_service_transaction_commits_idempotent_reservation() -> None:
             product_id = product.id
             provider_id = provider.id
             session.add(
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=product_id,
                     provider_id=provider_id,
                     on_hand=2,
@@ -289,7 +301,7 @@ async def test_service_transaction_commits_idempotent_reservation() -> None:
             ttl=timedelta(minutes=15),
         )
         user_id = uuid7()
-        item = ReservationItem(product_id=product_id, quantity=2)
+        item = ReservationItem(product_id=product_id, provider_id=provider_id, quantity=2)
 
         try:
             first = await service.create(
@@ -315,9 +327,9 @@ async def test_service_transaction_commits_idempotent_reservation() -> None:
                     delete(ReservationModel).where(ReservationModel.id == first_reservation_id)
                 )
                 await session.execute(
-                    delete(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id == product_id,
-                        InventoryLevelModel.provider_id == provider_id,
+                    delete(ProductOfferModel).where(
+                        ProductOfferModel.product_id == product_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
                 await session.execute(
@@ -362,13 +374,13 @@ async def test_insufficient_inventory_releases_previous_holds_and_persists_failu
             provider_id = provider.id
             session.add_all(
                 [
-                    InventoryLevelModel(
+                    ProductOfferModel(
                         product_id=available_product_id,
                         provider_id=provider_id,
                         on_hand=2,
                         reserved=0,
                     ),
-                    InventoryLevelModel(
+                    ProductOfferModel(
                         product_id=unavailable_product_id,
                         provider_id=provider_id,
                         on_hand=0,
@@ -391,10 +403,12 @@ async def test_insufficient_inventory_releases_previous_holds_and_persists_failu
                     items=(
                         ReservationItem(
                             product_id=available_product_id,
+                            provider_id=provider_id,
                             quantity=2,
                         ),
                         ReservationItem(
                             product_id=unavailable_product_id,
+                            provider_id=provider_id,
                             quantity=1,
                         ),
                     ),
@@ -418,11 +432,11 @@ async def test_insufficient_inventory_releases_previous_holds_and_persists_failu
                     delete(ReservationModel).where(ReservationModel.id == reservation_id)
                 )
                 await session.execute(
-                    delete(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id.in_(
+                    delete(ProductOfferModel).where(
+                        ProductOfferModel.product_id.in_(
                             (available_product_id, unavailable_product_id)
                         ),
-                        InventoryLevelModel.provider_id == provider_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
                 await session.execute(
@@ -467,7 +481,7 @@ async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
             product_id = product.id
             provider_id = provider.id
             session.add(
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=product_id,
                     provider_id=provider_id,
                     on_hand=5,
@@ -485,7 +499,9 @@ async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
         try:
             await service.create(
                 user_id=user_id,
-                items=(ReservationItem(product_id=product_id, quantity=2),),
+                items=(
+                    ReservationItem(product_id=product_id, provider_id=provider_id, quantity=2),
+                ),
                 idempotency_key="postgres-confirm",
             )
             first_confirmation = await service.confirm(
@@ -557,9 +573,9 @@ async def test_confirmed_reservation_consumes_internal_hold_once() -> None:
                     delete(ReservationModel).where(ReservationModel.id == reservation_id)
                 )
                 await session.execute(
-                    delete(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id == product_id,
-                        InventoryLevelModel.provider_id == provider_id,
+                    delete(ProductOfferModel).where(
+                        ProductOfferModel.product_id == product_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
                 await session.execute(
@@ -600,7 +616,7 @@ async def test_cancelled_reservation_releases_internal_hold_once() -> None:
             product_id = product.id
             provider_id = provider.id
             session.add(
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=product_id,
                     provider_id=provider_id,
                     on_hand=5,
@@ -618,7 +634,9 @@ async def test_cancelled_reservation_releases_internal_hold_once() -> None:
         try:
             await service.create(
                 user_id=user_id,
-                items=(ReservationItem(product_id=product_id, quantity=2),),
+                items=(
+                    ReservationItem(product_id=product_id, provider_id=provider_id, quantity=2),
+                ),
                 idempotency_key="postgres-cancel",
             )
             first_cancellation = await service.cancel(
@@ -675,9 +693,9 @@ async def test_cancelled_reservation_releases_internal_hold_once() -> None:
                     delete(ReservationModel).where(ReservationModel.id == reservation_id)
                 )
                 await session.execute(
-                    delete(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id == product_id,
-                        InventoryLevelModel.provider_id == provider_id,
+                    delete(ProductOfferModel).where(
+                        ProductOfferModel.product_id == product_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
                 await session.execute(
@@ -719,7 +737,7 @@ async def test_expiration_worker_releases_only_expired_reservations() -> None:
             product_id = product.id
             provider_id = provider.id
             session.add(
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=product_id,
                     provider_id=provider_id,
                     on_hand=5,
@@ -749,12 +767,16 @@ async def test_expiration_worker_releases_only_expired_reservations() -> None:
         try:
             await expired_service.create(
                 user_id=user_id,
-                items=(ReservationItem(product_id=product_id, quantity=2),),
+                items=(
+                    ReservationItem(product_id=product_id, provider_id=provider_id, quantity=2),
+                ),
                 idempotency_key="postgres-expired",
             )
             await future_service.create(
                 user_id=user_id,
-                items=(ReservationItem(product_id=product_id, quantity=1),),
+                items=(
+                    ReservationItem(product_id=product_id, provider_id=provider_id, quantity=1),
+                ),
                 idempotency_key="postgres-future",
             )
 
@@ -795,9 +817,9 @@ async def test_expiration_worker_releases_only_expired_reservations() -> None:
                     )
                 )
                 await session.execute(
-                    delete(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id == product_id,
-                        InventoryLevelModel.provider_id == provider_id,
+                    delete(ProductOfferModel).where(
+                        ProductOfferModel.product_id == product_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
                 await session.execute(

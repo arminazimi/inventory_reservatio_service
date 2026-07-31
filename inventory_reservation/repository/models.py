@@ -220,8 +220,8 @@ class ProviderCredentialModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
-class InventoryLevelModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "inventory_levels"
+class ProductOfferModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "product_offers"
     __table_args__ = (
         UniqueConstraint("product_id", "provider_id"),
         CheckConstraint("on_hand >= 0", name="non_negative_on_hand"),
@@ -230,8 +230,14 @@ class InventoryLevelModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint("version >= 1", name="positive_version"),
         CheckConstraint("allocation_priority >= 0", name="non_negative_allocation_priority"),
         Index(
-            "ix_inventory_levels_product_priority",
+            "ix_product_offers_product_priority",
             "product_id",
+            "allocation_priority",
+        ),
+        Index(
+            "ix_product_offers_routing_group_priority",
+            "product_id",
+            "routing_group",
             "allocation_priority",
         ),
     )
@@ -262,6 +268,7 @@ class InventoryLevelModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         default=100,
         server_default=text("100"),
     )
+    routing_group: Mapped[UUID | None] = mapped_column(Uuid)
     version: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -342,6 +349,10 @@ class ReservationItemModel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     product_id: Mapped[UUID] = mapped_column(
         ForeignKey("products.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    provider_id: Mapped[UUID] = mapped_column(
+        ForeignKey("inventory_providers.id", ondelete="RESTRICT"),
         nullable=False,
     )
     requested_quantity: Mapped[int] = mapped_column(Integer, nullable=False)

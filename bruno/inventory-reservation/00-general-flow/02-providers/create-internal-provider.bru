@@ -1,0 +1,45 @@
+meta {
+  name: Create Platform Warehouse Provider
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/providers
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "digikala-internal",
+    "kind": "internal",
+    "driver": "internal",
+    "base_url": null,
+    "request_timeout_ms": 500,
+    "capabilities": {
+      "availability": true,
+      "hold": true,
+      "confirm": true,
+      "release": true
+    }
+  }
+}
+
+script:post-response {
+  if (res.status === 201) {
+    bru.setVar("internalProviderId", res.body.id);
+  }
+}
+
+tests {
+  test("platform provider is created disabled", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.kind).to.equal("internal");
+    expect(res.body.is_enabled).to.equal(false);
+  });
+}

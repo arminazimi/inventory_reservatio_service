@@ -1,19 +1,22 @@
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from inventory_reservation.repository.models import (
-    InventoryLevelModel,
     InventoryProviderModel,
+    ProductOfferModel,
     ProviderCredentialModel,
     ProviderKind,
 )
 from inventory_reservation.repository.provider import ProviderRegistry
 from inventory_reservation.service.provider import (
+    AvailabilityCommand,
     HoldCommand,
     HoldProvider,
+    ProviderAvailabilityAttempt,
+    ProviderAvailabilityOutcome,
     ProviderHold,
     ProviderHoldAttempt,
     ProviderRouter,
@@ -52,9 +55,9 @@ class InventoryRepository:
         product_id: UUID,
         provider_id: UUID,
     ) -> InventorySnapshot | None:
-        statement = select(InventoryLevelModel).where(
-            InventoryLevelModel.product_id == product_id,
-            InventoryLevelModel.provider_id == provider_id,
+        statement = select(ProductOfferModel).where(
+            ProductOfferModel.product_id == product_id,
+            ProductOfferModel.provider_id == provider_id,
         )
         level = (await self._session.scalars(statement)).one_or_none()
 
@@ -77,17 +80,17 @@ class InventoryRepository:
         quantity: int,
     ) -> InventorySnapshot | None:
         statement = (
-            update(InventoryLevelModel)
+            update(ProductOfferModel)
             .where(
-                InventoryLevelModel.product_id == product_id,
-                InventoryLevelModel.provider_id == provider_id,
-                InventoryLevelModel.on_hand - InventoryLevelModel.reserved >= quantity,
+                ProductOfferModel.product_id == product_id,
+                ProductOfferModel.provider_id == provider_id,
+                ProductOfferModel.on_hand - ProductOfferModel.reserved >= quantity,
             )
             .values(
-                reserved=InventoryLevelModel.reserved + quantity,
-                version=InventoryLevelModel.version + 1,
+                reserved=ProductOfferModel.reserved + quantity,
+                version=ProductOfferModel.version + 1,
             )
-            .returning(InventoryLevelModel)
+            .returning(ProductOfferModel)
         )
         level = (await self._session.scalars(statement)).one_or_none()
 
@@ -110,19 +113,19 @@ class InventoryRepository:
         quantity: int,
     ) -> InventorySnapshot | None:
         statement = (
-            update(InventoryLevelModel)
+            update(ProductOfferModel)
             .where(
-                InventoryLevelModel.product_id == product_id,
-                InventoryLevelModel.provider_id == provider_id,
-                InventoryLevelModel.on_hand >= quantity,
-                InventoryLevelModel.reserved >= quantity,
+                ProductOfferModel.product_id == product_id,
+                ProductOfferModel.provider_id == provider_id,
+                ProductOfferModel.on_hand >= quantity,
+                ProductOfferModel.reserved >= quantity,
             )
             .values(
-                on_hand=InventoryLevelModel.on_hand - quantity,
-                reserved=InventoryLevelModel.reserved - quantity,
-                version=InventoryLevelModel.version + 1,
+                on_hand=ProductOfferModel.on_hand - quantity,
+                reserved=ProductOfferModel.reserved - quantity,
+                version=ProductOfferModel.version + 1,
             )
-            .returning(InventoryLevelModel)
+            .returning(ProductOfferModel)
         )
         level = (await self._session.scalars(statement)).one_or_none()
 
@@ -145,17 +148,17 @@ class InventoryRepository:
         quantity: int,
     ) -> InventorySnapshot | None:
         statement = (
-            update(InventoryLevelModel)
+            update(ProductOfferModel)
             .where(
-                InventoryLevelModel.product_id == product_id,
-                InventoryLevelModel.provider_id == provider_id,
-                InventoryLevelModel.reserved >= quantity,
+                ProductOfferModel.product_id == product_id,
+                ProductOfferModel.provider_id == provider_id,
+                ProductOfferModel.reserved >= quantity,
             )
             .values(
-                reserved=InventoryLevelModel.reserved - quantity,
-                version=InventoryLevelModel.version + 1,
+                reserved=ProductOfferModel.reserved - quantity,
+                version=ProductOfferModel.version + 1,
             )
-            .returning(InventoryLevelModel)
+            .returning(ProductOfferModel)
         )
         level = (await self._session.scalars(statement)).one_or_none()
 
@@ -170,54 +173,102 @@ class InventoryRepository:
             version=level.version,
         )
 
-    async def try_hold_available(
+    async def try_hold_selected(
         self,
         *,
         product_id: UUID,
+        provider_id: UUID,
         quantity: int,
         idempotency_key: str,
     ) -> ProviderHold | None:
+        selected_routing_group = await self._session.scalar(
+            select(ProductOfferModel.routing_group).where(
+                ProductOfferModel.product_id == product_id,
+                ProductOfferModel.provider_id == provider_id,
+            )
+        )
         candidates_statement = (
             select(
                 InventoryProviderModel,
                 ProviderCredentialModel,
             )
-            .select_from(InventoryLevelModel)
+            .select_from(ProductOfferModel)
             .join(
                 InventoryProviderModel,
-                InventoryProviderModel.id == InventoryLevelModel.provider_id,
+                InventoryProviderModel.id == ProductOfferModel.provider_id,
             )
             .outerjoin(
                 ProviderCredentialModel,
-                ProviderCredentialModel.provider_id
-                == InventoryProviderModel.id,
+                ProviderCredentialModel.provider_id == InventoryProviderModel.id,
             )
             .where(
-                InventoryLevelModel.product_id == product_id,
+                ProductOfferModel.product_id == product_id,
                 InventoryProviderModel.is_enabled.is_(True),
                 InventoryProviderModel.supports_hold.is_(True),
             )
             .order_by(
-                InventoryLevelModel.allocation_priority,
-                InventoryLevelModel.provider_id,
+                ProductOfferModel.allocation_priority,
+                ProductOfferModel.provider_id,
             )
         )
-        candidates = (
-            await self._session.execute(candidates_statement)
-        ).all()
+        if selected_routing_group is None:
+            candidates_statement = candidates_statement.where(
+                ProductOfferModel.provider_id == provider_id
+            )
+        else:
+            candidates_statement = candidates_statement.where(
+                ProductOfferModel.routing_group == selected_routing_group
+            )
+        candidates = (await self._session.execute(candidates_statement)).all()
+
+        configured_candidates = tuple(
+            (candidate, provider)
+            for candidate, credentials in candidates
+            if (
+                provider := self._hold_provider(
+                    candidate,
+                    credentials,
+                )
+            )
+            is not None
+        )
+
+        async def observe_availability(
+            observed_provider_id: UUID,
+            attempt: ProviderAvailabilityAttempt,
+        ) -> None:
+            if (
+                attempt.outcome is not ProviderAvailabilityOutcome.FRESH
+                or attempt.available_quantity is None
+            ):
+                return
+            await self._session.execute(
+                update(ProductOfferModel)
+                .where(
+                    ProductOfferModel.product_id == product_id,
+                    ProductOfferModel.provider_id == observed_provider_id,
+                )
+                .values(
+                    on_hand=func.greatest(
+                        ProductOfferModel.reserved,
+                        attempt.available_quantity,
+                    ),
+                    observed_at=attempt.observed_at,
+                    version=ProductOfferModel.version + 1,
+                )
+            )
 
         router = ProviderRouter(
-            tuple(
-                provider
-                for candidate, credentials in candidates
+            tuple(provider for _, provider in configured_candidates),
+            availability_provider_ids=frozenset(
+                candidate.id
+                for candidate, _ in configured_candidates
                 if (
-                    provider := self._hold_provider(
-                        candidate,
-                        credentials,
-                    )
+                    candidate.kind is ProviderKind.EXTERNAL
+                    and candidate.supports_availability
                 )
-                is not None
-            )
+            ),
+            availability_observer=observe_availability,
         )
         return await router.hold(
             HoldCommand(
@@ -249,9 +300,7 @@ class InventoryRepository:
                 credentials=(
                     ProviderCredentialConfiguration(
                         provider_id=credentials.provider_id,
-                        auth_type=ProviderAuthType(
-                            credentials.auth_type.value
-                        ),
+                        auth_type=ProviderAuthType(credentials.auth_type.value),
                         secret_ref=credentials.secret_ref,
                         public_config=credentials.public_config,
                     )
@@ -266,6 +315,18 @@ class InventoryRepository:
 class _InternalInventoryProvider:
     provider_id: UUID
     inventory_repository: InventoryRepository
+
+    async def availability(
+        self,
+        command: AvailabilityCommand,
+    ) -> ProviderAvailabilityAttempt:
+        snapshot = await self.inventory_repository.get_snapshot(
+            product_id=command.product_id,
+            provider_id=self.provider_id,
+        )
+        return ProviderAvailabilityAttempt.fresh(
+            available_quantity=snapshot.available if snapshot is not None else 0
+        )
 
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
         snapshot = await self.inventory_repository.try_hold(

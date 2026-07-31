@@ -1,0 +1,37 @@
+meta {
+  name: Retry Create With Same Idempotency Key
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: checkout-confirm-001
+}
+
+body:json {
+  {
+    "items": [
+      {
+        "product_id": "{{productId}}",
+        "provider_id": "{{sellerProviderId}}",
+        "quantity": 2
+      }
+    ]
+  }
+}
+
+tests {
+  test("idempotent retry returns the original reservation", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.id).to.equal(bru.getVar("reservationId"));
+    expect(res.body.status).to.equal("confirmed");
+  });
+}

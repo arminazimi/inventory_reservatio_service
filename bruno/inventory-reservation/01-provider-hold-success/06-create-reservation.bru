@@ -1,0 +1,33 @@
+meta {
+  name: Reservation Calls Provider And Holds Stock
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: external-hold-success-001
+}
+
+body:json {
+  {"items": [{"product_id": "{{externalProductId}}", "provider_id": "{{successProviderId}}", "quantity": 2}]}
+}
+
+script:post-response {
+  if (res.status === 201) bru.setVar("externalSuccessReservationId", res.body.id);
+}
+
+tests {
+  test("reservation stays pending with a remote hold", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.status).to.equal("pending");
+    expect(res.body.items[0].provider_id).to.equal(bru.getVar("successProviderId"));
+  });
+}

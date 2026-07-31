@@ -1,0 +1,21 @@
+meta {
+  name: Provider Confirmation Times Out Mid Flow
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations/{{confirmFailureReservationId}}/confirm
+  body: none
+  auth: none
+}
+
+headers {
+  X-User-ID: {{userId}}
+}
+tests {
+  test("reservation remains in durable confirming state", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.status).to.equal("confirming");
+  });
+}

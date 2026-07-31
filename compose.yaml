@@ -4,6 +4,34 @@ x-app-image: &app-image
   image: inventory-reservation:local
 
 services:
+  external-provider-mock:
+    <<: *app-image
+    command:
+      [
+        "uvicorn",
+        "inventory_reservation.controller.external_provider_mock:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "9000",
+      ]
+    ports:
+      - "${EXTERNAL_PROVIDER_MOCK_PORT:-9000}:9000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:9000/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    init: true
+    restart: unless-stopped
+
   postgres:
     image: postgres:17-alpine
     environment:
@@ -57,6 +85,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      external-provider-mock:
+        condition: service_healthy
     healthcheck:
       test:
         [

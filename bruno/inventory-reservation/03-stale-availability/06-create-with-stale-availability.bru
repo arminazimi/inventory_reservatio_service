@@ -1,0 +1,25 @@
+meta {
+  name: Stale Availability Does Not Override Atomic Hold
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: external-stale-availability-001
+}
+body:json {
+  {"items": [{"product_id": "{{externalProductId}}", "provider_id": "{{staleProviderId}}", "quantity": 1}]}
+}
+tests {
+  test("authoritative hold succeeds despite stale zero snapshot", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.status).to.equal("pending");
+  });
+}

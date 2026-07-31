@@ -120,10 +120,12 @@ class SqlAlchemyReservationRepository:
         )
         for item_model in reservation_model.items:
             hold_idempotency_key = (
-                f"reservation:{reservation.id}:product:{item_model.product_id}:hold"
+                f"reservation:{reservation.id}:product:{item_model.product_id}:"
+                f"provider:{item_model.provider_id}:hold"
             )
-            hold = await inventory_repository.try_hold_available(
+            hold = await inventory_repository.try_hold_selected(
                 product_id=item_model.product_id,
+                provider_id=item_model.provider_id,
                 quantity=item_model.requested_quantity,
                 idempotency_key=hold_idempotency_key,
             )
@@ -207,8 +209,7 @@ class SqlAlchemyReservationRepository:
             )
             .outerjoin(
                 ProviderCredentialModel,
-                ProviderCredentialModel.provider_id
-                == InventoryProviderModel.id,
+                ProviderCredentialModel.provider_id == InventoryProviderModel.id,
             )
             .where(ReservationItemModel.reservation_id == reservation.id)
             .with_for_update(of=InventoryAllocationModel)
@@ -433,8 +434,7 @@ class SqlAlchemyReservationRepository:
             )
             .outerjoin(
                 ProviderCredentialModel,
-                ProviderCredentialModel.provider_id
-                == InventoryProviderModel.id,
+                ProviderCredentialModel.provider_id == InventoryProviderModel.id,
             )
             .where(ReservationItemModel.reservation_id == reservation.id)
             .with_for_update(of=InventoryAllocationModel)
@@ -739,6 +739,7 @@ class SqlAlchemyReservationRepository:
             ReservationItemModel(
                 reservation_id=reservation.id,
                 product_id=item.product_id,
+                provider_id=item.provider_id,
                 requested_quantity=item.quantity,
             )
             for item in reservation.items
@@ -785,6 +786,7 @@ class SqlAlchemyReservationRepository:
             items=tuple(
                 ReservationItem(
                     product_id=item_model.product_id,
+                    provider_id=item_model.provider_id,
                     quantity=item_model.requested_quantity,
                 )
                 for item_model in item_models

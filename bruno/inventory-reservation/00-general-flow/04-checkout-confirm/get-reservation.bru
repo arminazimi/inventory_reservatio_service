@@ -1,0 +1,23 @@
+meta {
+  name: Get Pending Reservation
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/v1/reservations/{{reservationId}}
+  body: none
+  auth: none
+}
+
+headers {
+  X-User-ID: {{userId}}
+}
+
+tests {
+  test("owner can retrieve the pending reservation", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.id).to.equal(bru.getVar("reservationId"));
+    expect(res.body.status).to.equal("pending");
+  });
+}

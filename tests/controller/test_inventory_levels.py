@@ -88,6 +88,7 @@ class InMemoryInventoryLevelRepository:
         provider_id: UUID,
         on_hand: int,
         allocation_priority: int,
+        routing_group: UUID | None = None,
     ) -> InventoryLevel:
         key = (product_id, provider_id)
         current = self.levels.get(key)
@@ -99,10 +100,12 @@ class InMemoryInventoryLevelRepository:
                 reserved=0,
                 allocation_priority=allocation_priority,
                 version=1,
+                routing_group=routing_group,
             )
         elif (
             current.on_hand == on_hand
             and current.allocation_priority == allocation_priority
+            and current.routing_group == routing_group
         ):
             level = current
         else:
@@ -119,6 +122,7 @@ class InMemoryInventoryLevelRepository:
                 reserved=current.reserved,
                 allocation_priority=allocation_priority,
                 version=current.version + 1,
+                routing_group=routing_group,
             )
         self.levels[key] = level
         return level

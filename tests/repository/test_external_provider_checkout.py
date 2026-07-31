@@ -14,10 +14,10 @@ from inventory_reservation.repository.inventory import (
 from inventory_reservation.repository.models import (
     AllocationStatus,
     InventoryAllocationModel,
-    InventoryLevelModel,
     InventoryProviderModel,
     OrderModel,
     ProductModel,
+    ProductOfferModel,
     ProviderAuthType,
     ProviderCredentialModel,
     ProviderKind,
@@ -291,11 +291,9 @@ async def assert_external_confirmation_reconciliation(
     )
     first_reconciliation = await reconciliation_worker.run_once()
     pending_reservation = await service.get(reservation_id)
-    pending_allocation, pending_operation, pending_order = (
-        await load_external_confirmation_state(
-            database,
-            reservation_id=reservation_id,
-        )
+    pending_allocation, pending_operation, pending_order = await load_external_confirmation_state(
+        database,
+        reservation_id=reservation_id,
     )
 
     assert [reservation.id for reservation in first_reconciliation] == [reservation_id]
@@ -356,7 +354,7 @@ async def assert_external_confirmation_reconciliation(
 
 
 @pytest.mark.integration
-async def test_checkout_holds_external_provider_before_internal_fallback() -> None:
+async def test_checkout_holds_only_user_selected_external_provider() -> None:
     database = Database(
         os.getenv(
             "DATABASE_URL",
@@ -368,10 +366,7 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
     async def external_provider_api(request: httpx.Request) -> httpx.Response:
         nonlocal external_requests
         external_requests += 1
-        assert (
-            request.headers["Authorization"]
-            == "Bearer checkout-provider-token"
-        )
+        assert request.headers["Authorization"] == "Bearer checkout-provider-token"
         return httpx.Response(
             status_code=201,
             json={"hold_reference": "external-checkout-hold"},
@@ -402,10 +397,11 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
                     driver="http",
                     base_url="https://inventory-provider.example",
                     request_timeout_ms=2000,
+                    supports_availability=False,
                     supports_hold=True,
                 )
                 internal_provider = InventoryProviderModel(
-                    name=f"internal-checkout-fallback-{unique_suffix}",
+                    name=f"internal-checkout-alternative-{unique_suffix}",
                     kind=ProviderKind.INTERNAL,
                     driver="internal",
                     supports_hold=True,
@@ -423,14 +419,14 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
                             secret_ref="env://CHECKOUT_PROVIDER_TOKEN",
                             public_config={},
                         ),
-                        InventoryLevelModel(
+                        ProductOfferModel(
                             product_id=product_id,
                             provider_id=external_provider_id,
                             on_hand=0,
                             reserved=0,
                             allocation_priority=10,
                         ),
-                        InventoryLevelModel(
+                        ProductOfferModel(
                             product_id=product_id,
                             provider_id=internal_provider_id,
                             on_hand=5,
@@ -454,7 +450,13 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
             try:
                 reservation = await service.create(
                     user_id=uuid7(),
-                    items=(ReservationItem(product_id=product_id, quantity=2),),
+                    items=(
+                        ReservationItem(
+                            product_id=product_id,
+                            provider_id=external_provider_id,
+                            quantity=2,
+                        ),
+                    ),
                     idempotency_key="external-provider-checkout",
                 )
 
@@ -485,15 +487,174 @@ async def test_checkout_holds_external_provider_before_internal_fallback() -> No
                         delete(ReservationModel).where(ReservationModel.id == reservation_id)
                     )
                     await session.execute(
-                        delete(InventoryLevelModel).where(
-                            InventoryLevelModel.product_id == product_id
-                        )
+                        delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
                     )
                     await session.execute(
                         delete(InventoryProviderModel).where(
                             InventoryProviderModel.id.in_(
                                 (external_provider_id, internal_provider_id)
                             )
+                        )
+                    )
+                    await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_checkout_routes_within_external_provider_group_and_refreshes_snapshot() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    requests: list[tuple[str, str]] = []
+
+    async def external_provider_api(request: httpx.Request) -> httpx.Response:
+        requests.append((request.url.host, request.url.path))
+        if request.url.path.startswith("/availability/"):
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "available_quantity": (
+                        0 if request.url.host == "primary-provider.example" else 5
+                    ),
+                    "observed_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        assert request.url.host == "fallback-provider.example"
+        return httpx.Response(
+            status_code=201,
+            json={"hold_reference": "fallback-external-hold"},
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(external_provider_api)
+        ) as client:
+            provider_registry = ProviderRegistry(client=client)
+            async with database.session() as session, session.begin():
+                suffix = uuid7().hex
+                product = ProductModel(
+                    sku=f"EXTERNAL-ROUTING-{suffix}",
+                    name="External routing product",
+                )
+                primary = InventoryProviderModel(
+                    name=f"external-routing-primary-{suffix}",
+                    kind=ProviderKind.EXTERNAL,
+                    driver="http",
+                    base_url="https://primary-provider.example",
+                    supports_availability=True,
+                    supports_hold=True,
+                    supports_confirm=True,
+                    supports_release=True,
+                )
+                fallback = InventoryProviderModel(
+                    name=f"external-routing-fallback-{suffix}",
+                    kind=ProviderKind.EXTERNAL,
+                    driver="http",
+                    base_url="https://fallback-provider.example",
+                    supports_availability=True,
+                    supports_hold=True,
+                    supports_confirm=True,
+                    supports_release=True,
+                )
+                session.add_all([product, primary, fallback])
+                await session.flush()
+                product_id = product.id
+                primary_id = primary.id
+                fallback_id = fallback.id
+                routing_group = uuid7()
+                session.add_all(
+                    [
+                        ProductOfferModel(
+                            product_id=product_id,
+                            provider_id=primary_id,
+                            on_hand=99,
+                            allocation_priority=10,
+                            routing_group=routing_group,
+                        ),
+                        ProductOfferModel(
+                            product_id=product_id,
+                            provider_id=fallback_id,
+                            on_hand=99,
+                            allocation_priority=20,
+                            routing_group=routing_group,
+                        ),
+                    ]
+                )
+
+            reservation_id = uuid7()
+            service = ReservationService(
+                transaction_factory=lambda: reservation_transaction(
+                    database,
+                    provider_registry,
+                ),
+                clock=FixedClock(),
+                reservation_id_factory=lambda: reservation_id,
+                ttl=timedelta(minutes=15),
+            )
+
+            try:
+                reservation = await service.create(
+                    user_id=uuid7(),
+                    items=(
+                        ReservationItem(
+                            product_id=product_id,
+                            provider_id=primary_id,
+                            quantity=2,
+                        ),
+                    ),
+                    idempotency_key="external-routing-group",
+                )
+
+                async with database.session() as session:
+                    allocation_provider_id = await session.scalar(
+                        select(InventoryAllocationModel.provider_id)
+                        .join(
+                            ReservationItemModel,
+                            ReservationItemModel.id
+                            == InventoryAllocationModel.reservation_item_id,
+                        )
+                        .where(ReservationItemModel.reservation_id == reservation_id)
+                    )
+                    primary_snapshot = await InventoryRepository(session).get_snapshot(
+                        product_id=product_id,
+                        provider_id=primary_id,
+                    )
+                    fallback_snapshot = await InventoryRepository(session).get_snapshot(
+                        product_id=product_id,
+                        provider_id=fallback_id,
+                    )
+
+                assert reservation.status is ReservationStatus.PENDING
+                assert allocation_provider_id == fallback_id
+                assert primary_snapshot is not None
+                assert fallback_snapshot is not None
+                assert (primary_snapshot.on_hand, fallback_snapshot.on_hand) == (0, 5)
+                assert requests == [
+                    (
+                        "primary-provider.example",
+                        f"/availability/{product_id}",
+                    ),
+                    (
+                        "fallback-provider.example",
+                        f"/availability/{product_id}",
+                    ),
+                    ("fallback-provider.example", "/holds"),
+                ]
+            finally:
+                async with database.session() as session, session.begin():
+                    await session.execute(
+                        delete(ReservationModel).where(ReservationModel.id == reservation_id)
+                    )
+                    await session.execute(
+                        delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
+                    )
+                    await session.execute(
+                        delete(InventoryProviderModel).where(
+                            InventoryProviderModel.id.in_((primary_id, fallback_id))
                         )
                     )
                     await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
@@ -514,10 +675,7 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
     requests: list[tuple[str, str, str]] = []
 
     async def external_provider_api(request: httpx.Request) -> httpx.Response:
-        assert (
-            request.headers["Authorization"]
-            == "Bearer confirmation-provider-token"
-        )
+        assert request.headers["Authorization"] == "Bearer confirmation-provider-token"
         requests.append(
             (
                 request.method,
@@ -540,9 +698,7 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                 client=client,
                 secret_resolver=EnvironmentSecretResolver(
                     environ={
-                        "CONFIRMATION_PROVIDER_TOKEN": (
-                            "confirmation-provider-token"
-                        ),
+                        "CONFIRMATION_PROVIDER_TOKEN": ("confirmation-provider-token"),
                     }
                 ),
             )
@@ -559,6 +715,7 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                     driver="http",
                     base_url="https://inventory-provider.example",
                     request_timeout_ms=2000,
+                    supports_availability=False,
                     supports_hold=True,
                     supports_confirm=True,
                 )
@@ -574,7 +731,7 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                             secret_ref="env://CONFIRMATION_PROVIDER_TOKEN",
                             public_config={},
                         ),
-                        InventoryLevelModel(
+                        ProductOfferModel(
                             product_id=product_id,
                             provider_id=provider_id,
                             on_hand=0,
@@ -596,7 +753,9 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
             try:
                 await service.create(
                     user_id=user_id,
-                    items=(ReservationItem(product_id=product_id, quantity=2),),
+                    items=(
+                        ReservationItem(product_id=product_id, provider_id=provider_id, quantity=2),
+                    ),
                     idempotency_key="external-provider-confirm",
                 )
                 first_confirmation = await service.confirm(
@@ -620,7 +779,8 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                     (
                         "POST",
                         "/holds",
-                        f"reservation:{reservation_id}:product:{product_id}:hold",
+                        f"reservation:{reservation_id}:product:{product_id}:"
+                        f"provider:{provider_id}:hold",
                     ),
                     (
                         "POST",
@@ -652,9 +812,7 @@ async def test_external_hold_is_confirmed_once_and_operation_is_recorded() -> No
                         delete(ReservationModel).where(ReservationModel.id == reservation_id)
                     )
                     await session.execute(
-                        delete(InventoryLevelModel).where(
-                            InventoryLevelModel.product_id == product_id
-                        )
+                        delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
                     )
                     await session.execute(
                         delete(InventoryProviderModel).where(
@@ -713,6 +871,7 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                     driver="http",
                     base_url="https://inventory-provider.example",
                     request_timeout_ms=2000,
+                    supports_availability=False,
                     supports_hold=True,
                     supports_confirm=True,
                 )
@@ -721,7 +880,7 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                 product_id = product.id
                 provider_id = provider.id
                 session.add(
-                    InventoryLevelModel(
+                    ProductOfferModel(
                         product_id=product_id,
                         provider_id=provider_id,
                         on_hand=0,
@@ -742,7 +901,9 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
             try:
                 await service.create(
                     user_id=user_id,
-                    items=(ReservationItem(product_id=product_id, quantity=1),),
+                    items=(
+                        ReservationItem(product_id=product_id, provider_id=provider_id, quantity=1),
+                    ),
                     idempotency_key="unknown-external-confirm",
                 )
                 first_confirmation = await service.confirm(
@@ -782,9 +943,7 @@ async def test_unknown_external_confirmation_is_persisted_without_blind_retry() 
                         delete(ReservationModel).where(ReservationModel.id == reservation_id)
                     )
                     await session.execute(
-                        delete(InventoryLevelModel).where(
-                            InventoryLevelModel.product_id == product_id
-                        )
+                        delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
                     )
                     await session.execute(
                         delete(InventoryProviderModel).where(
@@ -809,10 +968,7 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
     requests: list[tuple[str, str, str]] = []
 
     async def external_provider_api(request: httpx.Request) -> httpx.Response:
-        assert (
-            request.headers["Authorization"]
-            == "Bearer release-provider-token"
-        )
+        assert request.headers["Authorization"] == "Bearer release-provider-token"
         requests.append(
             (
                 request.method,
@@ -852,6 +1008,7 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
                     driver="http",
                     base_url="https://inventory-provider.example",
                     request_timeout_ms=2000,
+                    supports_availability=False,
                     supports_hold=True,
                     supports_release=True,
                 )
@@ -867,7 +1024,7 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
                             secret_ref="env://RELEASE_PROVIDER_TOKEN",
                             public_config={},
                         ),
-                        InventoryLevelModel(
+                        ProductOfferModel(
                             product_id=product_id,
                             provider_id=provider_id,
                             on_hand=0,
@@ -889,7 +1046,9 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
             try:
                 await service.create(
                     user_id=user_id,
-                    items=(ReservationItem(product_id=product_id, quantity=2),),
+                    items=(
+                        ReservationItem(product_id=product_id, provider_id=provider_id, quantity=2),
+                    ),
                     idempotency_key="external-provider-release",
                 )
                 first_cancellation = await service.cancel(
@@ -913,7 +1072,8 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
                     (
                         "POST",
                         "/holds",
-                        f"reservation:{reservation_id}:product:{product_id}:hold",
+                        f"reservation:{reservation_id}:product:{product_id}:"
+                        f"provider:{provider_id}:hold",
                     ),
                     (
                         "POST",
@@ -939,9 +1099,7 @@ async def test_external_hold_is_released_once_and_operation_is_recorded() -> Non
                         delete(ReservationModel).where(ReservationModel.id == reservation_id)
                     )
                     await session.execute(
-                        delete(InventoryLevelModel).where(
-                            InventoryLevelModel.product_id == product_id
-                        )
+                        delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
                     )
                     await session.execute(
                         delete(InventoryProviderModel).where(
@@ -1000,6 +1158,7 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
                     driver="http",
                     base_url="https://inventory-provider.example",
                     request_timeout_ms=2000,
+                    supports_availability=False,
                     supports_hold=True,
                     supports_release=True,
                 )
@@ -1008,7 +1167,7 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
                 product_id = product.id
                 provider_id = provider.id
                 session.add(
-                    InventoryLevelModel(
+                    ProductOfferModel(
                         product_id=product_id,
                         provider_id=provider_id,
                         on_hand=0,
@@ -1029,7 +1188,9 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
             try:
                 await service.create(
                     user_id=user_id,
-                    items=(ReservationItem(product_id=product_id, quantity=1),),
+                    items=(
+                        ReservationItem(product_id=product_id, provider_id=provider_id, quantity=1),
+                    ),
                     idempotency_key="unknown-external-release",
                 )
                 first_cancellation = await service.cancel(
@@ -1077,9 +1238,7 @@ async def test_unknown_external_release_is_persisted_without_blind_retry() -> No
                         delete(ReservationModel).where(ReservationModel.id == reservation_id)
                     )
                     await session.execute(
-                        delete(InventoryLevelModel).where(
-                            InventoryLevelModel.product_id == product_id
-                        )
+                        delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
                     )
                     await session.execute(
                         delete(InventoryProviderModel).where(

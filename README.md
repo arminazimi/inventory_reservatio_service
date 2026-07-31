@@ -5,18 +5,18 @@ FastAPI, PostgreSQL, SQLAlchemy, Alembic, and Prometheus.
 
 The service temporarily reserves stock while payment is in progress, confirms
 the reservation after successful payment, and releases it after cancellation
-or expiry. It can allocate inventory from the platform or external providers
-without overselling internal stock or blindly failing over after an ambiguous
-remote timeout.
+or expiry. Each checkout line identifies the seller/provider selected on the
+product page, including the platform's own internal offer.
 
 ## What is implemented
 
 - Atomic, concurrency-safe internal inventory holds.
 - Idempotent reservation creation, confirmation, and cancellation.
 - Multi-item reservation with compensating release on partial failure.
-- Capability- and priority-aware provider routing.
+- Explicit product-offer selection by `(product_id, provider_id)`.
 - Internal inventory and HTTP-based external providers.
-- Definite out-of-stock/unavailable failover to the next provider.
+- Explicit `routing_group` fallback without cross-seller substitution.
+- Fresh/stale external availability classification and snapshot refresh.
 - Timeout handling as an unknown outcome, preventing unsafe double holds.
 - Per-provider circuit breakers with a single half-open recovery probe.
 - Durable reconciliation of unknown confirm and release operations.
@@ -61,6 +61,7 @@ background workers.
 | API metrics | `http://localhost:8000/metrics` | HTTP request and latency metrics |
 | Expiration metrics | `http://localhost:9101/metrics` | Expiry worker metrics |
 | Reconciliation metrics | `http://localhost:9102/metrics` | Recovery worker metrics |
+| Provider mock | `http://localhost:9000` | Deterministic external-provider scenarios |
 
 Compose waits for the API and both workers to become healthy. Inspect all
 processes:
@@ -176,6 +177,7 @@ RESERVATION_JSON=$(
     --data "{
       \"items\":[{
         \"product_id\":\"${PRODUCT_ID}\",
+        \"provider_id\":\"${PROVIDER_ID}\",
         \"quantity\":2
       }]
     }"
@@ -227,24 +229,48 @@ That test runs the FastAPI application in-process against the configured
 PostgreSQL database and removes the records it creates. It does not call the
 already-running Compose API.
 
+## Bruno collection
+
+A native Bruno collection is available in
+[`bruno/inventory-reservation`](bruno/inventory-reservation). Select its
+`local` environment and run the numbered folders in order against an empty
+business database. Response scripts carry generated product, provider, and
+reservation IDs between requests automatically.
+
+The collection has one self-contained general marketplace flow and four
+self-contained external-provider scenario folders. Each folder creates its own
+setup, so it can be run without executing another folder first. See
+[`docs/provider-scenarios.md`](docs/provider-scenarios.md) for the expected
+state transitions and the reason each scenario was selected.
+
 ## Provider behavior
 
-Inventory levels define provider eligibility and deterministic allocation
-priority. For an external provider, the inventory row is routing
-configuration—not an authoritative live-stock mirror. The remote hold response
-decides availability. A hold-capable external provider uses this contract:
+Each `product_offers` row associates one product with one provider. The caller
+selects that offer on the product page and sends both IDs in the reservation
+item. For an external provider, the row establishes the offer association; the
+remote hold response remains authoritative for availability. A hold-capable
+external provider uses this contract:
 
+- `GET /availability/{product_id}`
 - `POST /holds`
 - `POST /holds/{hold_reference}/confirm`
 - `POST /holds/{hold_reference}/release`
 
-Every operation receives a deterministic `Idempotency-Key`.
+Every operation receives a deterministic `Idempotency-Key`. A fresh
+availability response can skip a provider that conclusively lacks quantity;
+a stale response is advisory and the atomic hold remains authoritative.
 
-A conclusive out-of-stock response or temporary unavailability, such as a
-server failure or open circuit, can fall through to the next eligible
-provider. A timeout cannot: the provider may have accepted the hold before the
-response was lost, so the request fails closed instead of risking a double
-reservation.
+Fallback is opt-in. With no `routing_group`, the selected seller is the only
+candidate because price, warranty, and delivery terms can differ. When offers
+share a routing group, definite out-of-stock, server failure, or an open hold
+circuit advances to the next member by `allocation_priority`. A timeout is an
+unknown outcome, so routing stops: the provider may have accepted the hold
+before the response was lost and trying another provider could double-hold.
+
+Circuit state is isolated by provider operation. For example, a healthy
+availability endpoint cannot close a failing hold circuit. The default
+threshold is three failures, followed by a 30-second open interval and one
+half-open probe.
 
 Unknown confirmation and release outcomes are persisted in `confirming` or
 `releasing` state and retried by the reconciliation worker. An unknown initial
@@ -343,7 +369,7 @@ sizes, polling intervals, retry limits, and metrics ports.
 The test suite is organized around confirmed public seams rather than private
 implementation details:
 
-- `tests/service`: domain behavior, provider routing, circuit breaking, and
+- `tests/service`: domain behavior, provider policies, circuit breaking, and
   worker policy.
 - `tests/controller`: HTTP validation, status codes, and response contracts.
 - `tests/repository`: PostgreSQL concurrency, migrations, and external HTTP
@@ -365,7 +391,7 @@ docker build --check .
 ```
 
 Coverage is branch-aware and enforced at a minimum of 85%. The suite includes
-concurrent hold tests, idempotency races, provider timeout and failover cases,
+concurrent hold tests, idempotency races, selected-provider failure cases,
 multi-item compensation, reconciliation backoff, worker behavior, and a full
 HTTP checkout.
 
@@ -411,6 +437,9 @@ Read these documents in order:
   scale-driven redesign would persist an operation intent and execute remote
   I/O outside the transaction.
 - A single provider must satisfy an item; split fulfillment is not implemented.
+- The catalog owns offer presentation and commercial attributes. This bounded
+  context uses `(product_id, provider_id)` as the compact offer identity rather
+  than duplicating seller, price, warranty, or shipping tables.
 
 The deeper reasoning and production evolution plan are intentionally kept in
 `ARCHITECTURE.md` and `SCALABILITY.md` so this README stays executable and

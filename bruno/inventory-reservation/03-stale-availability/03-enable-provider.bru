@@ -1,0 +1,15 @@
+meta {
+  name: Enable Stale Provider
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/providers/{{staleProviderId}}/enable
+  body: none
+  auth: none
+}
+
+tests {
+  test("stale provider enabled", function() { expect(res.status).to.equal(200); });
+}

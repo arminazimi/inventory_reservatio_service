@@ -23,6 +23,7 @@ class ReservationItemRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     product_id: UUID
+    provider_id: UUID
     quantity: int = Field(gt=0)
 
 
@@ -34,6 +35,7 @@ class CreateReservationRequest(BaseModel):
 
 class ReservationItemResponse(BaseModel):
     product_id: UUID
+    provider_id: UUID
     quantity: int
 
 
@@ -54,6 +56,7 @@ class ReservationResponse(BaseModel):
             items=[
                 ReservationItemResponse(
                     product_id=item.product_id,
+                    provider_id=item.provider_id,
                     quantity=item.quantity,
                 )
                 for item in reservation.items
@@ -227,6 +230,7 @@ def create_reservation_router(reservation_service: ReservationService) -> APIRou
             items=tuple(
                 ReservationItem(
                     product_id=item.product_id,
+                    provider_id=item.provider_id,
                     quantity=item.quantity,
                 )
                 for item in request.items

@@ -1,0 +1,36 @@
+meta {
+  name: Selected Seller Is Out Of Stock
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: checkout-out-of-stock-001
+}
+
+body:json {
+  {
+    "items": [
+      {
+        "product_id": "{{productId}}",
+        "provider_id": "{{sellerProviderId}}",
+        "quantity": 2
+      }
+    ]
+  }
+}
+
+tests {
+  test("selected seller failure is returned to checkout", function() {
+    expect(res.status).to.equal(409);
+    expect(res.body.error.code).to.equal("insufficient_inventory");
+  });
+}

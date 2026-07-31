@@ -1,0 +1,21 @@
+meta {
+  name: Read Durable Confirmation State
+  type: http
+  seq: 8
+}
+
+get {
+  url: {{baseUrl}}/v1/reservations/{{confirmFailureReservationId}}
+  body: none
+  auth: none
+}
+
+headers {
+  X-User-ID: {{userId}}
+}
+tests {
+  test("unknown confirmation is not reported as confirmed or failed", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.status).to.equal("confirming");
+  });
+}

@@ -1,0 +1,19 @@
+meta {
+  name: Verify Availability And Hold Calls
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{providerMockUrl}}/admin/calls
+  body: none
+  auth: none
+}
+
+tests {
+  test("provider was queried then held exactly once", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body["success:availability"]).to.equal(1);
+    expect(res.body["success:hold"]).to.equal(1);
+  });
+}

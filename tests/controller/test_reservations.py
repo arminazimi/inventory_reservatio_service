@@ -14,6 +14,7 @@ from inventory_reservation.service.reservation import (
 
 FIXED_NOW = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 RESERVATION_TTL = timedelta(minutes=15)
+PROVIDER_ID = uuid7()
 
 
 class InMemoryReservationRepository:
@@ -90,6 +91,7 @@ async def test_user_can_create_reservation() -> None:
     reservation_id = uuid7()
     user_id = uuid7()
     product_id = uuid7()
+    provider_id = uuid7()
     repository = InMemoryReservationRepository()
     reservation_service = ReservationService(
         transaction_factory=lambda: in_memory_transaction(repository),
@@ -113,6 +115,7 @@ async def test_user_can_create_reservation() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(provider_id),
                         "quantity": 2,
                     }
                 ]
@@ -127,6 +130,7 @@ async def test_user_can_create_reservation() -> None:
         "items": [
             {
                 "product_id": str(product_id),
+                "provider_id": str(provider_id),
                 "quantity": 2,
             }
         ],
@@ -161,6 +165,7 @@ async def test_create_reservation_returns_conflict_when_inventory_is_insufficien
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]
@@ -204,6 +209,7 @@ async def test_reusing_idempotency_key_for_different_request_returns_conflict() 
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]
@@ -216,6 +222,7 @@ async def test_reusing_idempotency_key_for_different_request_returns_conflict() 
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 3,
                     }
                 ]
@@ -259,6 +266,7 @@ async def test_user_can_retrieve_reservation() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]
@@ -277,6 +285,7 @@ async def test_user_can_retrieve_reservation() -> None:
         "items": [
             {
                 "product_id": str(product_id),
+                "provider_id": str(PROVIDER_ID),
                 "quantity": 2,
             }
         ],
@@ -313,6 +322,7 @@ async def test_user_can_idempotently_confirm_reservation() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]
@@ -334,6 +344,7 @@ async def test_user_can_idempotently_confirm_reservation() -> None:
         "items": [
             {
                 "product_id": str(product_id),
+                "provider_id": str(PROVIDER_ID),
                 "quantity": 2,
             }
         ],
@@ -381,6 +392,7 @@ async def test_user_can_idempotently_cancel_pending_reservation() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]
@@ -402,6 +414,7 @@ async def test_user_can_idempotently_cancel_pending_reservation() -> None:
         "items": [
             {
                 "product_id": str(product_id),
+                "provider_id": str(PROVIDER_ID),
                 "quantity": 2,
             }
         ],
@@ -449,6 +462,7 @@ async def test_confirmed_reservation_cannot_be_cancelled() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]
@@ -501,6 +515,7 @@ async def test_cancelled_reservation_cannot_be_confirmed() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]
@@ -553,6 +568,7 @@ async def test_user_cannot_retrieve_another_users_reservation() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(PROVIDER_ID),
                         "quantity": 2,
                     }
                 ]

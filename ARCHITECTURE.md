@@ -85,8 +85,9 @@ and `SIGTERM` stop each polling loop gracefully.
 
 The Reservation is the consistency focus. It contains one or more requested
 items, an owner, an idempotency identity, a creation time, and an expiry time.
-Each item receives an Allocation recording the provider, quantity, hold
-reference, and current allocation status.
+Each item identifies the product offer selected by the caller through
+`(product_id, provider_id)`. It receives an Allocation recording that provider,
+quantity, hold reference, and current allocation status.
 
 The externally visible reservation states are:
 
@@ -127,13 +128,20 @@ reusing it for a different request returns a conflict. The database uniqueness
 constraint resolves the race where two identical create requests pass the
 initial read concurrently.
 
-For every item, eligible hold-capable providers are loaded in deterministic
-allocation-priority order. The router tries candidates until one conclusively
-holds stock. Internal inventory uses a single conditional SQL `UPDATE`, so the
-availability check and reservation increment are atomic. External inventory
-uses the provider hold contract and stores its hold reference in the
-allocation. The current model assigns the entire quantity of one item to one
-provider; it does not split a line across sources.
+For every item, the repository loads the offer selected by the caller. An
+ungrouped offer yields exactly one candidate. If that offer has a
+`routing_group`, only enabled, hold-capable offers for the same product and
+group are candidates, ordered by `allocation_priority`. This explicit group
+is the business boundary for substitution; unrelated sellers never enter the
+route.
+
+Internal inventory uses a conditional SQL `UPDATE`, so the availability check
+and reservation increment are atomic. External candidates may first return a
+fresh availability observation. Fresh insufficient stock skips that candidate;
+stale data is advisory and does not override the authoritative atomic hold.
+Fresh observations update the local product-offer snapshot. The successful
+hold reference and actual allocation provider are persisted. One provider
+still satisfies the entire line; split fulfillment is not implemented.
 
 If a later item cannot be allocated, every earlier allocation is compensated.
 Internal holds are returned and external holds are released with deterministic
@@ -183,16 +191,18 @@ Provider outcomes are classified deliberately:
 - **Held / confirmed / released:** apply the corresponding local transition.
 - **Out of stock or definite rejection:** treat as a conclusive business
   result.
-- **Temporary unavailability:** allow another eligible hold provider to be
-  considered.
-- **Unknown outcome, usually a timeout:** do not fail over blindly. The first
-  provider may already have accepted the operation, so trying another could
-  double-reserve or double-consume inventory.
+- **Out of stock, temporary unavailability, or an open circuit:** try the next
+  candidate only when it belongs to the selected offer's explicit routing
+  group; otherwise fail the selected offer.
+- **Unknown outcome, usually a timeout:** fail closed and do not try another
+  provider. The selected provider may already have accepted the operation.
 
 The in-process circuit breaker counts transport/server failures and unknown
 outcomes, opens after a configurable threshold, rejects calls during its
-recovery window, and permits only one half-open probe. Its state is
-intentionally per process; correctness does not depend on sharing it.
+recovery window, and permits only one half-open probe. State is independent per
+provider operation, so a successful availability call cannot reset a failing
+hold circuit. Breaker state is intentionally per process; correctness does not
+depend on sharing it.
 
 There is no distributed transaction between PostgreSQL and an external
 provider. External calls currently execute while a database transaction is
@@ -203,26 +213,12 @@ remove it.
 
 ## Provider Scenarios
 
-The implementation and tests cover more than the two scenarios requested:
-
-1. **External hold succeeds.** The provider is called before internal fallback,
-   its hold reference is stored, confirmation is sent once, and exactly one
-   order is created. This proves the primary marketplace checkout path.
-2. **A hold times out.** The result is classified as unknown and routing stops
-   instead of falling back. This is important because a timeout can happen
-   after the provider committed the hold.
-3. **Confirmation or release times out.** The reservation enters
-   `confirming` or `releasing`; the durable operation is retried with the same
-   key only after its persisted backoff expires. This demonstrates recovery
-   from the most dangerous mid-lifecycle failure.
-4. **A provider is unavailable.** Failures contribute to circuit state, and a
-   conclusive unavailable result allows another capable provider to serve the
-   hold. Half-open probing prevents a recovering provider from receiving a
-   burst of probes.
-
-These scenarios were chosen because they exercise different correctness
-decisions. A successful call proves integration, while timeout handling proves
-that failure semantics—not just HTTP wiring—were designed.
+All four requested scenarios are implemented as automated tests and executable
+Bruno folders. They cover a successful remote hold, server failure with
+group-scoped fallback and an open circuit, stale availability followed by an
+authoritative hold, and a confirmation timeout that leaves durable
+`confirming` work for reconciliation. The full rationale and manual runbook are
+in `docs/provider-scenarios.md`.
 
 ## Deliberate Scope Decisions
 
@@ -262,9 +258,10 @@ that failure semantics—not just HTTP wiring—were designed.
   bounded context.
 - External providers honor idempotency keys for hold, confirm, and release.
   Retrying an unknown operation would otherwise be unsafe.
-- Provider priority is configured per inventory level and is deterministic.
+- `allocation_priority` may order offers in operational/catalog projections,
+  but checkout does not use it to override the caller's provider selection.
 - A single provider must satisfy the full quantity for one reservation item.
-- External availability rows establish product/provider eligibility; the
+- Product-offer rows establish product/provider eligibility; the
   provider remains authoritative when its hold endpoint is called.
 - A release returning `404` means the hold no longer exists and is therefore
   idempotently released.

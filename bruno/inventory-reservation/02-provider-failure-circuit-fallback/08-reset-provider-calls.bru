@@ -1,0 +1,15 @@
+meta {
+  name: Reset Provider Call Counters
+  type: http
+  seq: 8
+}
+
+delete {
+  url: {{providerMockUrl}}/admin/calls
+  body: none
+  auth: none
+}
+
+tests {
+  test("provider counters reset", function() { expect(res.status).to.equal(204); });
+}

@@ -1,0 +1,25 @@
+meta {
+  name: First Provider Failure Falls Back
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: external-fallback-001
+}
+body:json {
+  {"items": [{"product_id": "{{externalProductId}}", "provider_id": "{{failingProviderId}}", "quantity": 1}]}
+}
+tests {
+  test("checkout succeeds through grouped fallback", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.status).to.equal("pending");
+  });
+}

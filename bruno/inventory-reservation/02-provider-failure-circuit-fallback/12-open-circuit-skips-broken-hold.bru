@@ -1,0 +1,31 @@
+meta {
+  name: Open Circuit Skips Broken Hold Endpoint
+  type: http
+  seq: 12
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: external-fallback-004
+}
+body:json {
+  {
+    "items": [
+      {
+        "product_id": "{{externalProductId}}",
+        "provider_id": "{{failingProviderId}}",
+        "quantity": 1
+      }
+    ]
+  }
+}
+tests {
+  test("checkout remains available while primary circuit is open", function() { expect(res.status).to.equal(201); });
+}

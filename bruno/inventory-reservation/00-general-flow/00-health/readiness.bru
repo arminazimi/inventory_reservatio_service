@@ -1,0 +1,19 @@
+meta {
+  name: Readiness
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{baseUrl}}/health/ready
+  body: none
+  auth: none
+}
+
+tests {
+  test("API and database are ready", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.status).to.equal("ready");
+    expect(res.body.checks.database).to.equal("up");
+  });
+}

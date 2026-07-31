@@ -9,9 +9,9 @@ from sqlalchemy import delete
 
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.models import (
-    InventoryLevelModel,
     InventoryProviderModel,
     ProductModel,
+    ProductOfferModel,
     ProviderKind,
     ReservationModel,
 )
@@ -64,6 +64,7 @@ async def seed_compensation_inventory(database: Database) -> CompensationInvento
             driver="http",
             base_url="https://inventory-provider.example",
             request_timeout_ms=2000,
+            supports_availability=False,
             supports_hold=True,
             supports_release=True,
         )
@@ -91,14 +92,14 @@ async def seed_compensation_inventory(database: Database) -> CompensationInvento
         )
         session.add_all(
             [
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=inventory.external_product_id,
                     provider_id=inventory.external_provider_id,
                     on_hand=0,
                     reserved=0,
                     allocation_priority=1,
                 ),
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=inventory.unavailable_product_id,
                     provider_id=inventory.internal_provider_id,
                     on_hand=0,
@@ -117,17 +118,13 @@ async def delete_compensation_inventory(
     inventory: CompensationInventory,
 ) -> None:
     async with database.session() as session, session.begin():
-        await session.execute(
-            delete(ReservationModel).where(ReservationModel.id == reservation_id)
-        )
+        await session.execute(delete(ReservationModel).where(ReservationModel.id == reservation_id))
         product_ids = (
             inventory.external_product_id,
             inventory.unavailable_product_id,
         )
         await session.execute(
-            delete(InventoryLevelModel).where(
-                InventoryLevelModel.product_id.in_(product_ids)
-            )
+            delete(ProductOfferModel).where(ProductOfferModel.product_id.in_(product_ids))
         )
         await session.execute(
             delete(InventoryProviderModel).where(
@@ -139,9 +136,7 @@ async def delete_compensation_inventory(
                 )
             )
         )
-        await session.execute(
-            delete(ProductModel).where(ProductModel.id.in_(product_ids))
-        )
+        await session.execute(delete(ProductModel).where(ProductModel.id.in_(product_ids)))
 
 
 @pytest.mark.integration
@@ -193,8 +188,16 @@ async def test_later_item_failure_compensates_an_external_hold_once(
                 ttl=timedelta(minutes=15),
             )
             items = (
-                ReservationItem(product_id=inventory.external_product_id, quantity=1),
-                ReservationItem(product_id=inventory.unavailable_product_id, quantity=1),
+                ReservationItem(
+                    product_id=inventory.external_product_id,
+                    provider_id=inventory.external_provider_id,
+                    quantity=1,
+                ),
+                ReservationItem(
+                    product_id=inventory.unavailable_product_id,
+                    provider_id=inventory.internal_provider_id,
+                    quantity=1,
+                ),
             )
 
             try:
@@ -254,9 +257,7 @@ async def test_later_item_failure_compensates_an_external_hold_once(
                 assert reservation.release_target_status is None
                 assert requests == [
                     "/holds",
-                    *(
-                        ["/holds/partial-checkout-hold/release"] * (release_timeouts + 1)
-                    ),
+                    *(["/holds/partial-checkout-hold/release"] * (release_timeouts + 1)),
                 ]
             finally:
                 await delete_compensation_inventory(

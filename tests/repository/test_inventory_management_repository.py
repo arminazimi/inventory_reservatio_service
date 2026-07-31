@@ -9,9 +9,9 @@ from inventory_reservation.repository.inventory_management import (
     SqlAlchemyInventoryLevelRepository,
 )
 from inventory_reservation.repository.models import (
-    InventoryLevelModel,
     InventoryProviderModel,
     ProductModel,
+    ProductOfferModel,
     ProviderKind,
 )
 from inventory_reservation.service.inventory_management import (
@@ -122,19 +122,15 @@ async def test_inventory_assignment_is_persisted_idempotently() -> None:
     finally:
         async with database.session() as session, session.begin():
             await session.execute(
-                delete(InventoryLevelModel).where(
-                    InventoryLevelModel.product_id == product_id,
-                    InventoryLevelModel.provider_id == provider_id,
+                delete(ProductOfferModel).where(
+                    ProductOfferModel.product_id == product_id,
+                    ProductOfferModel.provider_id == provider_id,
                 )
             )
             await session.execute(
-                delete(InventoryProviderModel).where(
-                    InventoryProviderModel.id == provider_id
-                )
+                delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
             )
-            await session.execute(
-                delete(ProductModel).where(ProductModel.id == product_id)
-            )
+            await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
         await database.close()
 
 
@@ -177,7 +173,7 @@ async def test_product_inventory_is_listed_in_allocation_order() -> None:
             await session.flush()
             session.add_all(
                 (
-                    InventoryLevelModel(
+                    ProductOfferModel(
                         product_id=product_id,
                         provider_id=first_provider_id,
                         on_hand=12,
@@ -185,7 +181,7 @@ async def test_product_inventory_is_listed_in_allocation_order() -> None:
                         allocation_priority=20,
                         version=3,
                     ),
-                    InventoryLevelModel(
+                    ProductOfferModel(
                         product_id=product_id,
                         provider_id=second_provider_id,
                         on_hand=8,
@@ -196,9 +192,7 @@ async def test_product_inventory_is_listed_in_allocation_order() -> None:
                 )
             )
 
-        levels = await SqlAlchemyInventoryLevelRepository(
-            database
-        ).list_by_product(product_id)
+        levels = await SqlAlchemyInventoryLevelRepository(database).list_by_product(product_id)
 
         assert levels == (
             InventoryLevel(
@@ -221,20 +215,14 @@ async def test_product_inventory_is_listed_in_allocation_order() -> None:
     finally:
         async with database.session() as session, session.begin():
             await session.execute(
-                delete(InventoryLevelModel).where(
-                    InventoryLevelModel.product_id == product_id
-                )
+                delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
             )
             await session.execute(
                 delete(InventoryProviderModel).where(
-                    InventoryProviderModel.id.in_(
-                        (first_provider_id, second_provider_id)
-                    )
+                    InventoryProviderModel.id.in_((first_provider_id, second_provider_id))
                 )
             )
-            await session.execute(
-                delete(ProductModel).where(ProductModel.id == product_id)
-            )
+            await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
         await database.close()
 
 
@@ -269,7 +257,7 @@ async def test_inventory_cannot_be_persisted_below_reserved_quantity() -> None:
             )
             await session.flush()
             session.add(
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=product_id,
                     provider_id=provider_id,
                     on_hand=12,
@@ -295,9 +283,7 @@ async def test_inventory_cannot_be_persisted_below_reserved_quantity() -> None:
             on_hand=12,
             allocation_priority=10,
         )
-        with pytest.raises(
-            InventoryHasActiveReservationsError
-        ) as removal_error:
+        with pytest.raises(InventoryHasActiveReservationsError) as removal_error:
             await repository.remove_level(
                 product_id=product_id,
                 provider_id=provider_id,
@@ -343,17 +329,13 @@ async def test_inventory_cannot_be_persisted_below_reserved_quantity() -> None:
     finally:
         async with database.session() as session, session.begin():
             await session.execute(
-                delete(InventoryLevelModel).where(
-                    InventoryLevelModel.product_id == product_id,
-                    InventoryLevelModel.provider_id == provider_id,
+                delete(ProductOfferModel).where(
+                    ProductOfferModel.product_id == product_id,
+                    ProductOfferModel.provider_id == provider_id,
                 )
             )
             await session.execute(
-                delete(InventoryProviderModel).where(
-                    InventoryProviderModel.id == provider_id
-                )
+                delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
             )
-            await session.execute(
-                delete(ProductModel).where(ProductModel.id == product_id)
-            )
+            await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
         await database.close()

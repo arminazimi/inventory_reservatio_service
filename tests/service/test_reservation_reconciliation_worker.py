@@ -69,7 +69,7 @@ def reservation() -> Reservation:
     return Reservation(
         id=uuid7(),
         user_id=uuid7(),
-        items=(ReservationItem(product_id=uuid7(), quantity=1),),
+        items=(ReservationItem(provider_id=uuid7(), product_id=uuid7(), quantity=1),),
         idempotency_key=f"reconciliation-{uuid7()}",
         request_fingerprint="known-fingerprint",
         created_at=FIXED_NOW - timedelta(minutes=1),
@@ -161,21 +161,13 @@ async def test_worker_exports_batch_outcomes_and_reservation_statuses() -> None:
     await worker.run(stop_event)
 
     metrics = generate_latest(registry).decode()
+    assert 'inventory_reservation_reconciliation_batches_total{outcome="failed"} 1.0' in metrics
+    assert 'inventory_reservation_reconciliation_batches_total{outcome="succeeded"} 1.0' in metrics
     assert (
-        'inventory_reservation_reconciliation_batches_total{outcome="failed"} 1.0'
-        in metrics
+        'inventory_reservation_reconciliation_reservations_total{status="confirmed"} 1.0' in metrics
     )
     assert (
-        'inventory_reservation_reconciliation_batches_total{outcome="succeeded"} 1.0'
-        in metrics
-    )
-    assert (
-        'inventory_reservation_reconciliation_reservations_total{status="confirmed"} 1.0'
-        in metrics
-    )
-    assert (
-        'inventory_reservation_reconciliation_reservations_total{status="releasing"} 1.0'
-        in metrics
+        'inventory_reservation_reconciliation_reservations_total{status="releasing"} 1.0' in metrics
     )
 
 

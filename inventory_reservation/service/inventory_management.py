@@ -16,6 +16,7 @@ class InventoryLevel:
     reserved: int
     allocation_priority: int
     version: int
+    routing_group: UUID | None = None
 
     @property
     def available(self) -> int:
@@ -28,6 +29,7 @@ class SetInventoryLevelCommand:
     provider_id: UUID
     on_hand: int
     allocation_priority: int
+    routing_group: UUID | None = None
 
 
 class InventoryBelowReservedError(ValueError):
@@ -108,6 +110,7 @@ class InventoryLevelRepositoryPort(Protocol):
         provider_id: UUID,
         on_hand: int,
         allocation_priority: int,
+        routing_group: UUID | None = None,
     ) -> InventoryLevel: ...
 
 
@@ -181,4 +184,5 @@ class InventoryManagementService:
             provider_id=command.provider_id,
             on_hand=command.on_hand,
             allocation_priority=command.allocation_priority,
+            routing_group=command.routing_group,
         )

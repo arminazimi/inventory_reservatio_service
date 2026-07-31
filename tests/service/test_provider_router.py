@@ -4,8 +4,10 @@ from uuid import UUID
 import pytest
 
 from inventory_reservation.service.provider import (
+    AvailabilityCommand,
     CircuitBreakerProvider,
     HoldCommand,
+    ProviderAvailabilityAttempt,
     ProviderCallFailedError,
     ProviderHold,
     ProviderHoldAttempt,
@@ -30,6 +32,45 @@ class StubHoldProvider:
 
     async def hold(self, _: HoldCommand) -> ProviderHoldAttempt:
         return self._attempt
+
+
+class AvailabilityAwareStubProvider(StubHoldProvider):
+    def __init__(
+        self,
+        *,
+        provider_id: UUID,
+        availability: ProviderAvailabilityAttempt,
+        hold: ProviderHoldAttempt,
+    ) -> None:
+        super().__init__(provider_id=provider_id, attempt=hold)
+        self._availability = availability
+        self.hold_calls = 0
+
+    async def availability(
+        self,
+        _: AvailabilityCommand,
+    ) -> ProviderAvailabilityAttempt:
+        return self._availability
+
+    async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
+        self.hold_calls += 1
+        return await super().hold(command)
+
+
+class HealthyAvailabilityFailingHoldProvider:
+    def __init__(self, *, provider_id: UUID) -> None:
+        self.provider_id = provider_id
+        self.hold_calls = 0
+
+    async def availability(
+        self,
+        _: AvailabilityCommand,
+    ) -> ProviderAvailabilityAttempt:
+        return ProviderAvailabilityAttempt.fresh(available_quantity=10)
+
+    async def hold(self, _: HoldCommand) -> ProviderHoldAttempt:
+        self.hold_calls += 1
+        raise ProviderCallFailedError(self.provider_id)
 
 
 class RecoveringHoldProvider:
@@ -109,6 +150,55 @@ async def test_hold_falls_back_when_preferred_provider_is_out_of_stock() -> None
     )
 
 
+async def test_fresh_insufficient_availability_skips_to_next_provider() -> None:
+    insufficient_provider = AvailabilityAwareStubProvider(
+        provider_id=FIRST_PROVIDER_ID,
+        availability=ProviderAvailabilityAttempt.fresh(available_quantity=1),
+        hold=ProviderHoldAttempt.held(reference="must-not-be-used"),
+    )
+    fallback_provider = AvailabilityAwareStubProvider(
+        provider_id=SECOND_PROVIDER_ID,
+        availability=ProviderAvailabilityAttempt.fresh(available_quantity=5),
+        hold=ProviderHoldAttempt.held(reference="fallback-after-availability"),
+    )
+
+    hold = await ProviderRouter((insufficient_provider, fallback_provider)).hold(
+        HoldCommand(
+            product_id=PRODUCT_ID,
+            quantity=2,
+            idempotency_key="availability-aware-hold",
+        )
+    )
+
+    assert hold == ProviderHold(
+        provider_id=SECOND_PROVIDER_ID,
+        reference="fallback-after-availability",
+    )
+    assert (insufficient_provider.hold_calls, fallback_provider.hold_calls) == (0, 1)
+
+
+async def test_stale_availability_is_not_trusted_over_atomic_hold() -> None:
+    stale_provider = AvailabilityAwareStubProvider(
+        provider_id=FIRST_PROVIDER_ID,
+        availability=ProviderAvailabilityAttempt.stale(available_quantity=0),
+        hold=ProviderHoldAttempt.held(reference="authoritative-hold"),
+    )
+
+    hold = await ProviderRouter((stale_provider,)).hold(
+        HoldCommand(
+            product_id=PRODUCT_ID,
+            quantity=2,
+            idempotency_key="stale-availability-hold",
+        )
+    )
+
+    assert hold == ProviderHold(
+        provider_id=FIRST_PROVIDER_ID,
+        reference="authoritative-hold",
+    )
+    assert stale_provider.hold_calls == 1
+
+
 async def test_hold_does_not_fall_back_when_provider_outcome_is_unknown() -> None:
     unknown_provider = StubHoldProvider(
         provider_id=FIRST_PROVIDER_ID,
@@ -169,6 +259,32 @@ async def test_open_circuit_routes_subsequent_holds_to_fallback_provider() -> No
         provider_id=SECOND_PROVIDER_ID,
         reference="fallback-hold",
     )
+
+
+async def test_successful_availability_does_not_reset_hold_circuit() -> None:
+    primary = HealthyAvailabilityFailingHoldProvider(provider_id=FIRST_PROVIDER_ID)
+    protected_provider = CircuitBreakerProvider(
+        provider=primary,
+        failure_threshold=2,
+    )
+    fallback_provider = StubHoldProvider(
+        provider_id=SECOND_PROVIDER_ID,
+        attempt=ProviderHoldAttempt.held(reference="fallback-hold"),
+    )
+    router = ProviderRouter((protected_provider, fallback_provider))
+
+    for attempt_number in (1, 2, 3):
+        hold = await router.hold(
+            HoldCommand(
+                product_id=PRODUCT_ID,
+                quantity=2,
+                idempotency_key=f"availability-then-hold:{attempt_number}",
+            )
+        )
+        assert hold is not None
+        assert hold.provider_id == SECOND_PROVIDER_ID
+
+    assert primary.hold_calls == 2
 
 
 async def test_open_circuit_probes_provider_after_recovery_timeout() -> None:

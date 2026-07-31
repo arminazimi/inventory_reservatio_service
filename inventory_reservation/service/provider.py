@@ -1,8 +1,9 @@
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 from uuid import UUID
 
 
@@ -24,6 +25,54 @@ class ProviderReleaseOutcome(StrEnum):
     RELEASED = "released"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     UNKNOWN = "unknown"
+
+
+class ProviderAvailabilityOutcome(StrEnum):
+    FRESH = "fresh"
+    STALE = "stale"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class AvailabilityCommand:
+    product_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAvailabilityAttempt:
+    outcome: ProviderAvailabilityOutcome
+    available_quantity: int | None = None
+    observed_at: datetime | None = None
+
+    @classmethod
+    def fresh(
+        cls,
+        *,
+        available_quantity: int,
+        observed_at: datetime | None = None,
+    ) -> ProviderAvailabilityAttempt:
+        return cls(
+            outcome=ProviderAvailabilityOutcome.FRESH,
+            available_quantity=available_quantity,
+            observed_at=observed_at,
+        )
+
+    @classmethod
+    def stale(
+        cls,
+        *,
+        available_quantity: int,
+        observed_at: datetime | None = None,
+    ) -> ProviderAvailabilityAttempt:
+        return cls(
+            outcome=ProviderAvailabilityOutcome.STALE,
+            available_quantity=available_quantity,
+            observed_at=observed_at,
+        )
+
+    @classmethod
+    def temporarily_unavailable(cls) -> ProviderAvailabilityAttempt:
+        return cls(outcome=ProviderAvailabilityOutcome.TEMPORARILY_UNAVAILABLE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +170,17 @@ class HoldProvider(Protocol):
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt: ...
 
 
+@runtime_checkable
+class AvailabilityProvider(Protocol):
+    @property
+    def provider_id(self) -> UUID: ...
+
+    async def availability(
+        self,
+        command: AvailabilityCommand,
+    ) -> ProviderAvailabilityAttempt: ...
+
+
 class ConfirmProvider(Protocol):
     @property
     def provider_id(self) -> UUID: ...
@@ -135,7 +195,13 @@ class ReleaseProvider(Protocol):
     async def release(self, command: ReleaseCommand) -> ProviderReleaseAttempt: ...
 
 
-class InventoryProvider(HoldProvider, ConfirmProvider, ReleaseProvider, Protocol):
+class InventoryProvider(
+    AvailabilityProvider,
+    HoldProvider,
+    ConfirmProvider,
+    ReleaseProvider,
+    Protocol,
+):
     pass
 
 
@@ -158,7 +224,15 @@ ProviderAttemptT = TypeVar(
     ProviderHoldAttempt,
     ProviderConfirmAttempt,
     ProviderReleaseAttempt,
+    ProviderAvailabilityAttempt,
 )
+
+
+@dataclass(slots=True)
+class _CircuitState:
+    failure_count: int = 0
+    opened_at: float | None = None
+    probe_in_flight: bool = False
 
 
 class CircuitBreakerProvider:
@@ -175,12 +249,34 @@ class CircuitBreakerProvider:
         self._failure_threshold = failure_threshold
         self._recovery_timeout = recovery_timeout
         self._monotonic = monotonic
-        self._failure_count = 0
-        self._opened_at: float | None = None
-        self._probe_in_flight = False
+        # Availability, hold, confirm, and release have different failure
+        # characteristics. A healthy stock read must not close a broken hold
+        # circuit (and vice versa).
+        self._states = {
+            "availability": _CircuitState(),
+            "hold": _CircuitState(),
+            "confirm": _CircuitState(),
+            "release": _CircuitState(),
+        }
+
+    async def availability(
+        self,
+        command: AvailabilityCommand,
+    ) -> ProviderAvailabilityAttempt:
+        if not isinstance(self._provider, AvailabilityProvider):
+            return ProviderAvailabilityAttempt.stale(  # type: ignore[unreachable]
+                available_quantity=0
+            )
+        return await self._execute(
+            state=self._states["availability"],
+            operation=lambda: self._provider.availability(command),
+            temporarily_unavailable=ProviderAvailabilityAttempt.temporarily_unavailable,
+            is_unknown=lambda _: False,
+        )
 
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
         return await self._execute(
+            state=self._states["hold"],
             operation=lambda: self._provider.hold(command),
             temporarily_unavailable=ProviderHoldAttempt.temporarily_unavailable,
             is_unknown=lambda attempt: attempt.outcome is ProviderHoldOutcome.UNKNOWN,
@@ -188,6 +284,7 @@ class CircuitBreakerProvider:
 
     async def confirm(self, command: ConfirmCommand) -> ProviderConfirmAttempt:
         return await self._execute(
+            state=self._states["confirm"],
             operation=lambda: self._provider.confirm(command),
             temporarily_unavailable=ProviderConfirmAttempt.temporarily_unavailable,
             is_unknown=lambda attempt: attempt.outcome is ProviderConfirmOutcome.UNKNOWN,
@@ -195,6 +292,7 @@ class CircuitBreakerProvider:
 
     async def release(self, command: ReleaseCommand) -> ProviderReleaseAttempt:
         return await self._execute(
+            state=self._states["release"],
             operation=lambda: self._provider.release(command),
             temporarily_unavailable=ProviderReleaseAttempt.temporarily_unavailable,
             is_unknown=lambda attempt: attempt.outcome is ProviderReleaseOutcome.UNKNOWN,
@@ -203,40 +301,41 @@ class CircuitBreakerProvider:
     async def _execute(
         self,
         *,
+        state: _CircuitState,
         operation: Callable[[], Awaitable[ProviderAttemptT]],
         temporarily_unavailable: Callable[[], ProviderAttemptT],
         is_unknown: Callable[[ProviderAttemptT], bool],
     ) -> ProviderAttemptT:
         is_probe = False
-        if self._opened_at is not None:
-            if self._monotonic() - self._opened_at < self._recovery_timeout:
+        if state.opened_at is not None:
+            if self._monotonic() - state.opened_at < self._recovery_timeout:
                 return temporarily_unavailable()
-            if self._probe_in_flight:
+            if state.probe_in_flight:
                 return temporarily_unavailable()
-            self._probe_in_flight = True
+            state.probe_in_flight = True
             is_probe = True
 
         try:
             try:
                 attempt = await operation()
             except ProviderCallFailedError:
-                self._failure_count += 1
-                if self._failure_count >= self._failure_threshold:
-                    self._opened_at = self._monotonic()
+                state.failure_count += 1
+                if state.failure_count >= self._failure_threshold:
+                    state.opened_at = self._monotonic()
                 return temporarily_unavailable()
 
             if is_unknown(attempt):
-                self._failure_count += 1
-                if self._failure_count >= self._failure_threshold:
-                    self._opened_at = self._monotonic()
+                state.failure_count += 1
+                if state.failure_count >= self._failure_threshold:
+                    state.opened_at = self._monotonic()
                 return attempt
 
-            self._failure_count = 0
-            self._opened_at = None
+            state.failure_count = 0
+            state.opened_at = None
             return attempt
         finally:
             if is_probe:
-                self._probe_in_flight = False
+                state.probe_in_flight = False
 
 
 class UnknownProviderOutcomeError(RuntimeError):
@@ -256,11 +355,53 @@ class UnknownProviderOutcomeError(RuntimeError):
 class ProviderRouter:
     """Try hold-capable providers in caller-supplied allocation order."""
 
-    def __init__(self, providers: tuple[HoldProvider, ...]) -> None:
+    def __init__(
+        self,
+        providers: tuple[HoldProvider, ...],
+        *,
+        availability_provider_ids: frozenset[UUID] | None = None,
+        availability_observer: Callable[
+            [UUID, ProviderAvailabilityAttempt], Awaitable[None]
+        ]
+        | None = None,
+    ) -> None:
         self._providers = providers
+        self._availability_provider_ids = (
+            availability_provider_ids
+            if availability_provider_ids is not None
+            else frozenset(
+                provider.provider_id
+                for provider in providers
+                if isinstance(provider, AvailabilityProvider)
+            )
+        )
+        self._availability_observer = availability_observer
 
     async def hold(self, command: HoldCommand) -> ProviderHold | None:
         for provider in self._providers:
+            if (
+                provider.provider_id in self._availability_provider_ids
+                and isinstance(provider, AvailabilityProvider)
+            ):
+                availability = await provider.availability(
+                    AvailabilityCommand(product_id=command.product_id)
+                )
+                if self._availability_observer is not None:
+                    await self._availability_observer(
+                        provider.provider_id,
+                        availability,
+                    )
+                if (
+                    availability.outcome
+                    is ProviderAvailabilityOutcome.TEMPORARILY_UNAVAILABLE
+                ):
+                    continue
+                if (
+                    availability.outcome is ProviderAvailabilityOutcome.FRESH
+                    and availability.available_quantity is not None
+                    and availability.available_quantity < command.quantity
+                ):
+                    continue
             attempt = await provider.hold(command)
             if attempt.outcome is ProviderHoldOutcome.HELD:
                 return ProviderHold(

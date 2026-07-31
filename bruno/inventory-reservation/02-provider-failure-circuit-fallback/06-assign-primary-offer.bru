@@ -1,0 +1,21 @@
+meta {
+  name: Assign Failing Primary Offer
+  type: http
+  seq: 6
+}
+
+put {
+  url: {{baseUrl}}/internal/v1/products/{{externalProductId}}/providers/{{failingProviderId}}/inventory
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+body:json {
+  {"on_hand": 99, "allocation_priority": 10, "routing_group": "0191f4b8-7d4a-7000-8000-000000000099"}
+}
+tests {
+  test("failing primary assigned to fallback group", function() { expect(res.status).to.equal(200); });
+}

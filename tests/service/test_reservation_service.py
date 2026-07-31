@@ -16,7 +16,8 @@ from inventory_reservation.service.reservation import (
 FIXED_NOW = datetime(2026, 7, 29, 12, 0, tzinfo=UTC)
 RESERVATION_TTL = timedelta(minutes=15)
 PRODUCT_ID = UUID("00000000-0000-7000-8000-000000000001")
-REQUEST_FINGERPRINT = "fe03f417e4461cf79cf202c472aa615af4922ea6f68c61faa6a19c4b529b7e94"
+PROVIDER_ID = UUID("00000000-0000-7000-8000-000000000002")
+REQUEST_FINGERPRINT = "11fcd0a74921195c62ea5421f9308d93976cf5b451740bd3f67173c45a658cd9"
 
 
 class InMemoryReservationRepository:
@@ -70,7 +71,7 @@ async def in_memory_transaction(
 async def test_created_reservation_is_retrievable() -> None:
     reservation_id = uuid7()
     user_id = uuid7()
-    item = ReservationItem(product_id=PRODUCT_ID, quantity=2)
+    item = ReservationItem(product_id=PRODUCT_ID, provider_id=PROVIDER_ID, quantity=2)
     repository = InMemoryReservationRepository()
     service = ReservationService(
         transaction_factory=lambda: in_memory_transaction(repository),
@@ -101,7 +102,7 @@ async def test_repeated_create_with_same_key_returns_original_reservation() -> N
     next_reservation_id = uuid7()
     reservation_ids = iter((first_reservation_id, next_reservation_id))
     user_id = uuid7()
-    item = ReservationItem(product_id=PRODUCT_ID, quantity=2)
+    item = ReservationItem(product_id=PRODUCT_ID, provider_id=PROVIDER_ID, quantity=2)
     repository = InMemoryReservationRepository()
     service = ReservationService(
         transaction_factory=lambda: in_memory_transaction(repository),
@@ -135,14 +136,14 @@ async def test_reused_idempotency_key_with_different_payload_is_rejected() -> No
     )
     await service.create(
         user_id=user_id,
-        items=(ReservationItem(product_id=PRODUCT_ID, quantity=2),),
+        items=(ReservationItem(product_id=PRODUCT_ID, provider_id=PROVIDER_ID, quantity=2),),
         idempotency_key="checkout-conflict",
     )
 
     with pytest.raises(IdempotencyConflictError):
         await service.create(
             user_id=user_id,
-            items=(ReservationItem(product_id=PRODUCT_ID, quantity=3),),
+            items=(ReservationItem(product_id=PRODUCT_ID, provider_id=PROVIDER_ID, quantity=3),),
             idempotency_key="checkout-conflict",
         )
 
@@ -158,13 +159,13 @@ async def test_created_reservation_holds_inventory_for_checkout() -> None:
 
     await service.create(
         user_id=uuid7(),
-        items=(ReservationItem(product_id=PRODUCT_ID, quantity=2),),
+        items=(ReservationItem(product_id=PRODUCT_ID, provider_id=PROVIDER_ID, quantity=2),),
         idempotency_key="checkout-holds-stock",
     )
 
     with pytest.raises(InsufficientInventoryError):
         await service.create(
             user_id=uuid7(),
-            items=(ReservationItem(product_id=PRODUCT_ID, quantity=1),),
+            items=(ReservationItem(product_id=PRODUCT_ID, provider_id=PROVIDER_ID, quantity=1),),
             idempotency_key="checkout-cannot-reuse-held-stock",
         )

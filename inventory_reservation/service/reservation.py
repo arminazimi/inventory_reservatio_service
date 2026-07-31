@@ -70,6 +70,7 @@ class ReservationStatus(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ReservationItem:
     product_id: UUID
+    provider_id: UUID
     quantity: int
 
     def __post_init__(self) -> None:
@@ -240,9 +241,7 @@ class ReconciliationBatchFailed:
     duration_seconds: float
 
 
-type ReconciliationBatchObservation = (
-    ReconciliationBatchSucceeded | ReconciliationBatchFailed
-)
+type ReconciliationBatchObservation = ReconciliationBatchSucceeded | ReconciliationBatchFailed
 
 
 class ReconciliationWorkerObserver(Protocol):
@@ -470,9 +469,7 @@ class ReservationReconciliationWorker:
         self._transaction_factory = transaction_factory
         self._clock = clock
         self._config = config
-        self._observer = (
-            observer if observer is not None else NullReconciliationWorkerObserver()
-        )
+        self._observer = observer if observer is not None else NullReconciliationWorkerObserver()
         self._monotonic_clock = monotonic_clock
 
     async def run_once(self) -> tuple[Reservation, ...]:
@@ -541,8 +538,11 @@ class ReconciliationWorkerRunSummary:
 
 def _reservation_request_fingerprint(items: tuple[ReservationItem, ...]) -> str:
     canonical_items = "|".join(
-        f"{item.product_id}:{item.quantity}"
-        for item in sorted(items, key=lambda item: item.product_id.int)
+        f"{item.product_id}:{item.provider_id}:{item.quantity}"
+        for item in sorted(
+            items,
+            key=lambda item: (item.product_id.int, item.provider_id.int),
+        )
     )
     return sha256(canonical_items.encode()).hexdigest()
 

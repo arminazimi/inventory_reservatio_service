@@ -1,0 +1,24 @@
+meta {
+  name: Assign Stale Offer
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/internal/v1/products/{{externalProductId}}/providers/{{staleProviderId}}/inventory
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+body:json {
+  {
+    "on_hand": 99,
+    "allocation_priority": 10
+  }
+}
+tests {
+  test("stale offer assigned", function() { expect(res.status).to.equal(200); });
+}

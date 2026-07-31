@@ -1,0 +1,21 @@
+meta {
+  name: Assign Fallback Offer
+  type: http
+  seq: 7
+}
+
+put {
+  url: {{baseUrl}}/internal/v1/products/{{externalProductId}}/providers/{{fallbackProviderId}}/inventory
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+body:json {
+  {"on_hand": 99, "allocation_priority": 20, "routing_group": "0191f4b8-7d4a-7000-8000-000000000099"}
+}
+tests {
+  test("fallback assigned to same routing group", function() { expect(res.status).to.equal(200); });
+}

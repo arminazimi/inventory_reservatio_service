@@ -1,0 +1,15 @@
+meta {
+  name: Enable Confirmation Timeout Provider
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/providers/{{confirmTimeoutProviderId}}/enable
+  body: none
+  auth: none
+}
+
+tests {
+  test("confirmation-timeout provider enabled", function() { expect(res.status).to.equal(200); });
+}

@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import httpx
@@ -10,8 +11,10 @@ from inventory_reservation.repository.provider import (
     ProviderAuthentication,
 )
 from inventory_reservation.service.provider import (
+    AvailabilityCommand,
     ConfirmCommand,
     HoldCommand,
+    ProviderAvailabilityAttempt,
     ProviderCallFailedError,
     ProviderConfirmAttempt,
     ProviderHoldAttempt,
@@ -26,6 +29,7 @@ from inventory_reservation.service.provider_management import (
 
 PROVIDER_ID = UUID("00000000-0000-7000-8000-000000000001")
 PRODUCT_ID = UUID("00000000-0000-7000-8000-000000000002")
+FIXED_NOW = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 
 
 async def test_environment_secret_reference_is_resolved() -> None:
@@ -53,6 +57,39 @@ class ApiKeySecretResolver:
 class FailingSecretResolver:
     async def resolve(self, _: str) -> str:
         raise SecretResolutionError
+
+
+async def test_stale_external_availability_is_classified_as_advisory() -> None:
+    async def provider_api(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/availability/{PRODUCT_ID}"
+        return httpx.Response(
+            status_code=200,
+            json={
+                "available_quantity": 0,
+                "observed_at": "2026-07-31T11:58:00Z",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(provider_api)
+    ) as client:
+        provider = HttpInventoryProvider(
+            provider_id=PROVIDER_ID,
+            base_url="https://inventory-provider.example",
+            timeout=2.0,
+            client=client,
+            availability_max_age=timedelta(seconds=60),
+            clock=lambda: FIXED_NOW,
+        )
+
+        availability = await provider.availability(
+            AvailabilityCommand(product_id=PRODUCT_ID)
+        )
+
+    assert availability == ProviderAvailabilityAttempt.stale(
+        available_quantity=0,
+        observed_at=datetime(2026, 7, 31, 11, 58, tzinfo=UTC),
+    )
 
 
 async def test_bearer_credentials_authenticate_provider_request() -> None:

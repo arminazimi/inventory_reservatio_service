@@ -1,0 +1,45 @@
+meta {
+  name: Create Marketplace Seller
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/providers
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "seller-alpha",
+    "kind": "internal",
+    "driver": "internal",
+    "base_url": null,
+    "request_timeout_ms": 500,
+    "capabilities": {
+      "availability": true,
+      "hold": true,
+      "confirm": true,
+      "release": true
+    }
+  }
+}
+
+script:post-response {
+  if (res.status === 201) {
+    bru.setVar("sellerProviderId", res.body.id);
+  }
+}
+
+tests {
+  test("marketplace seller is created disabled", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.name).to.equal("seller-alpha");
+    expect(res.body.is_enabled).to.equal(false);
+  });
+}

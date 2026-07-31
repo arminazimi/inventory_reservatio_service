@@ -1,17 +1,20 @@
 import os
 from base64 import b64encode
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from inventory_reservation.service.provider import (
+    AvailabilityCommand,
     CircuitBreakerProvider,
     ConfirmCommand,
     HoldCommand,
     InventoryProvider,
+    ProviderAvailabilityAttempt,
     ProviderCallFailedError,
     ProviderConfirmAttempt,
     ProviderHoldAttempt,
@@ -30,6 +33,17 @@ class _HoldResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hold_reference: str
+
+
+class _AvailabilityResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    available_quantity: int = Field(ge=0)
+    observed_at: datetime
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class EnvironmentSecretResolver:
@@ -65,7 +79,7 @@ class ProviderAuthentication:
 class HttpInventoryProvider:
     """Adapt the external provider hold HTTP contract to the domain port."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         provider_id: UUID,
@@ -73,12 +87,50 @@ class HttpInventoryProvider:
         timeout: float,
         client: httpx.AsyncClient,
         authentication: ProviderAuthentication | None = None,
+        availability_max_age: timedelta = timedelta(seconds=60),
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.provider_id = provider_id
         self._hold_url = f"{base_url.rstrip('/')}/holds"
         self._timeout = timeout
         self._client = client
         self._authentication = authentication
+        self._availability_max_age = availability_max_age
+        self._clock = clock
+
+    async def availability(
+        self,
+        command: AvailabilityCommand,
+    ) -> ProviderAvailabilityAttempt:
+        try:
+            response = await self._client.get(
+                f"{self._hold_url.removesuffix('/holds')}/availability/{command.product_id}",
+                headers=await self._request_headers(
+                    f"availability:product:{command.product_id}"
+                ),
+                timeout=self._timeout,
+            )
+        except httpx.TimeoutException:
+            return ProviderAvailabilityAttempt.temporarily_unavailable()
+
+        if response.is_server_error:
+            raise ProviderCallFailedError(self.provider_id)
+        response.raise_for_status()
+        try:
+            payload = _AvailabilityResponse.model_validate(response.json())
+        except (ValidationError, ValueError):
+            raise ProviderCallFailedError(self.provider_id) from None
+        if payload.observed_at.tzinfo is None:
+            raise ProviderCallFailedError(self.provider_id)
+        if self._clock() - payload.observed_at > self._availability_max_age:
+            return ProviderAvailabilityAttempt.stale(
+                available_quantity=payload.available_quantity,
+                observed_at=payload.observed_at,
+            )
+        return ProviderAvailabilityAttempt.fresh(
+            available_quantity=payload.available_quantity,
+            observed_at=payload.observed_at,
+        )
 
     async def hold(self, command: HoldCommand) -> ProviderHoldAttempt:
         try:

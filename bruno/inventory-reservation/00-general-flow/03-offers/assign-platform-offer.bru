@@ -1,0 +1,32 @@
+meta {
+  name: Assign Platform Offer
+  type: http
+  seq: 1
+}
+
+put {
+  url: {{baseUrl}}/internal/v1/products/{{productId}}/providers/{{internalProviderId}}/inventory
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "on_hand": 10,
+    "allocation_priority": 10
+  }
+}
+
+tests {
+  test("platform offer has ten available units", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.provider_id).to.equal(bru.getVar("internalProviderId"));
+    expect(res.body.on_hand).to.equal(10);
+    expect(res.body.reserved).to.equal(0);
+    expect(res.body.available).to.equal(10);
+  });
+}

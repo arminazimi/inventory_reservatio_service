@@ -13,13 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_TABLES = {
     "alembic_version",
     "inventory_allocations",
-    "inventory_levels",
     "inventory_providers",
     "order_items",
     "orders",
     "products",
     "provider_credentials",
     "provider_operations",
+    "product_offers",
     "reservation_items",
     "reservations",
 }
@@ -39,12 +39,25 @@ async def test_latest_migration_creates_the_complete_schema() -> None:
     engine = create_async_engine(database_url)
     try:
         async with engine.connect() as connection:
-            table_names, reservation_columns = await connection.run_sync(
+            (
+                table_names,
+                offer_columns,
+                reservation_columns,
+                reservation_item_columns,
+            ) = await connection.run_sync(
                 lambda sync_connection: (
                     set(inspect(sync_connection).get_table_names()),
                     {
                         column["name"]
+                        for column in inspect(sync_connection).get_columns("product_offers")
+                    },
+                    {
+                        column["name"]
                         for column in inspect(sync_connection).get_columns("reservations")
+                    },
+                    {
+                        column["name"]
+                        for column in inspect(sync_connection).get_columns("reservation_items")
                     },
                 )
             )
@@ -52,4 +65,6 @@ async def test_latest_migration_creates_the_complete_schema() -> None:
         await engine.dispose()
 
     assert table_names == EXPECTED_TABLES
+    assert "routing_group" in offer_columns
     assert "release_target_status" in reservation_columns
+    assert "provider_id" in reservation_item_columns

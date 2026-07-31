@@ -20,6 +20,7 @@ class SetInventoryLevelRequest(BaseModel):
 
     on_hand: int = Field(ge=0)
     allocation_priority: int = Field(ge=0)
+    routing_group: UUID | None = None
 
 
 class InventoryLevelResponse(BaseModel):
@@ -30,6 +31,7 @@ class InventoryLevelResponse(BaseModel):
     available: int
     allocation_priority: int
     version: int
+    routing_group: UUID | None
 
     @classmethod
     def from_domain(
@@ -44,6 +46,7 @@ class InventoryLevelResponse(BaseModel):
             available=level.available,
             allocation_priority=level.allocation_priority,
             version=level.version,
+            routing_group=level.routing_group,
         )
 
 
@@ -132,7 +135,10 @@ def create_inventory_management_router(
         tags=["internal inventory"],
     )
 
-    @router.get("/{product_id}/inventory")
+    @router.get(
+        "/{product_id}/inventory",
+        response_model_exclude_none=True,
+    )
     async def list_product_inventory(
         product_id: Annotated[UUID, Path()],
     ) -> list[InventoryLevelResponse]:
@@ -146,6 +152,7 @@ def create_inventory_management_router(
 
     @router.get(
         "/{product_id}/providers/{provider_id}/inventory",
+        response_model_exclude_none=True,
         responses={
             status.HTTP_404_NOT_FOUND: {
                 "model": InventoryErrorResponse,
@@ -189,6 +196,7 @@ def create_inventory_management_router(
 
     @router.put(
         "/{product_id}/providers/{provider_id}/inventory",
+        response_model_exclude_none=True,
         responses={
             status.HTTP_409_CONFLICT: {
                 "model": InventoryErrorResponse,
@@ -209,6 +217,7 @@ def create_inventory_management_router(
                 provider_id=provider_id,
                 on_hand=request.on_hand,
                 allocation_priority=request.allocation_priority,
+                routing_group=request.routing_group,
             )
         )
         return InventoryLevelResponse.from_domain(level)

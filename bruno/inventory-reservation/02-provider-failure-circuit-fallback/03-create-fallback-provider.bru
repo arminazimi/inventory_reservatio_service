@@ -1,0 +1,34 @@
+meta {
+  name: Create Fallback Provider
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/providers
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "bruno-external-fallback",
+    "kind": "external",
+    "driver": "http",
+    "base_url": "http://external-provider-mock:9000/scenarios/success",
+    "request_timeout_ms": 300,
+    "capabilities": {"availability": true, "hold": true, "confirm": true, "release": true}
+  }
+}
+
+script:post-response {
+  if (res.status === 201) bru.setVar("fallbackProviderId", res.body.id);
+}
+
+tests {
+  test("fallback provider is registered", function() { expect(res.status).to.equal(201); });
+}

@@ -1,0 +1,43 @@
+meta {
+  name: Reserve Selected Marketplace Seller
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: checkout-confirm-001
+}
+
+body:json {
+  {
+    "items": [
+      {
+        "product_id": "{{productId}}",
+        "provider_id": "{{sellerProviderId}}",
+        "quantity": 2
+      }
+    ]
+  }
+}
+
+script:post-response {
+  if (res.status === 201) {
+    bru.setVar("reservationId", res.body.id);
+  }
+}
+
+tests {
+  test("selected seller reservation is pending", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.status).to.equal("pending");
+    expect(res.body.items[0].provider_id).to.equal(bru.getVar("sellerProviderId"));
+  });
+}

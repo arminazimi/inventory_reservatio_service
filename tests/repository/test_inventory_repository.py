@@ -11,9 +11,9 @@ from inventory_reservation.repository.inventory import (
     InventorySnapshot,
 )
 from inventory_reservation.repository.models import (
-    InventoryLevelModel,
     InventoryProviderModel,
     ProductModel,
+    ProductOfferModel,
     ProviderKind,
 )
 
@@ -42,7 +42,7 @@ async def test_try_hold_reserves_available_stock() -> None:
                 session.add_all([product, provider])
                 await session.flush()
 
-                level = InventoryLevelModel(
+                level = ProductOfferModel(
                     product_id=product.id,
                     provider_id=provider.id,
                     on_hand=5,
@@ -98,7 +98,7 @@ async def test_try_hold_keeps_inventory_unchanged_when_stock_is_insufficient() -
                 await session.flush()
 
                 session.add(
-                    InventoryLevelModel(
+                    ProductOfferModel(
                         product_id=product.id,
                         provider_id=provider.id,
                         on_hand=5,
@@ -135,6 +135,168 @@ async def test_try_hold_keeps_inventory_unchanged_when_stock_is_insufficient() -
 
 
 @pytest.mark.integration
+async def test_try_hold_selected_reserves_only_the_user_selected_provider() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+
+    try:
+        async with database.session() as session:
+            try:
+                product = ProductModel(sku="SELECTED-OFFER", name="Selected offer")
+                first_provider = InventoryProviderModel(
+                    name="selected-offer-first",
+                    kind=ProviderKind.INTERNAL,
+                    driver="internal",
+                    supports_hold=True,
+                )
+                selected_provider = InventoryProviderModel(
+                    name="selected-offer-second",
+                    kind=ProviderKind.INTERNAL,
+                    driver="internal",
+                    supports_hold=True,
+                )
+                session.add_all([product, first_provider, selected_provider])
+                await session.flush()
+                session.add_all(
+                    [
+                        ProductOfferModel(
+                            product_id=product.id,
+                            provider_id=first_provider.id,
+                            on_hand=10,
+                            allocation_priority=1,
+                        ),
+                        ProductOfferModel(
+                            product_id=product.id,
+                            provider_id=selected_provider.id,
+                            on_hand=10,
+                            allocation_priority=100,
+                        ),
+                    ]
+                )
+                await session.flush()
+
+                repository = InventoryRepository(session)
+                hold = await repository.try_hold_selected(
+                    product_id=product.id,
+                    provider_id=selected_provider.id,
+                    quantity=2,
+                    idempotency_key="selected-offer-hold",
+                )
+
+                assert hold is not None
+                assert hold.provider_id == selected_provider.id
+                assert await repository.get_snapshot(
+                    product_id=product.id,
+                    provider_id=first_provider.id,
+                ) == InventorySnapshot(
+                    product_id=product.id,
+                    provider_id=first_provider.id,
+                    on_hand=10,
+                    reserved=0,
+                    version=1,
+                )
+                assert await repository.get_snapshot(
+                    product_id=product.id,
+                    provider_id=selected_provider.id,
+                ) == InventorySnapshot(
+                    product_id=product.id,
+                    provider_id=selected_provider.id,
+                    on_hand=10,
+                    reserved=2,
+                    version=2,
+                )
+            finally:
+                await session.rollback()
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
+async def test_selected_offer_falls_back_only_inside_its_routing_group() -> None:
+    database = Database(
+        os.getenv(
+            "DATABASE_URL",
+            "postgresql+asyncpg://inventory:inventory@localhost:5432/inventory",
+        )
+    )
+    routing_group = uuid7()
+
+    try:
+        async with database.session() as session:
+            try:
+                product = ProductModel(sku=f"ROUTING-{uuid7().hex}", name="Routed offer")
+                primary = InventoryProviderModel(
+                    name=f"routing-primary-{uuid7().hex}",
+                    kind=ProviderKind.INTERNAL,
+                    driver="internal",
+                    supports_hold=True,
+                )
+                fallback = InventoryProviderModel(
+                    name=f"routing-fallback-{uuid7().hex}",
+                    kind=ProviderKind.INTERNAL,
+                    driver="internal",
+                    supports_hold=True,
+                )
+                unrelated = InventoryProviderModel(
+                    name=f"routing-unrelated-{uuid7().hex}",
+                    kind=ProviderKind.INTERNAL,
+                    driver="internal",
+                    supports_hold=True,
+                )
+                session.add_all([product, primary, fallback, unrelated])
+                await session.flush()
+                session.add_all(
+                    [
+                        ProductOfferModel(
+                            product_id=product.id,
+                            provider_id=primary.id,
+                            on_hand=0,
+                            allocation_priority=10,
+                            routing_group=routing_group,
+                        ),
+                        ProductOfferModel(
+                            product_id=product.id,
+                            provider_id=fallback.id,
+                            on_hand=5,
+                            allocation_priority=20,
+                            routing_group=routing_group,
+                        ),
+                        ProductOfferModel(
+                            product_id=product.id,
+                            provider_id=unrelated.id,
+                            on_hand=5,
+                            allocation_priority=1,
+                        ),
+                    ]
+                )
+                await session.flush()
+
+                hold = await InventoryRepository(session).try_hold_selected(
+                    product_id=product.id,
+                    provider_id=primary.id,
+                    quantity=2,
+                    idempotency_key="routing-group-hold",
+                )
+
+                assert hold is not None
+                assert hold.provider_id == fallback.id
+                assert (
+                    await InventoryRepository(session).get_snapshot(
+                        product_id=product.id,
+                        provider_id=unrelated.id,
+                    )
+                ).reserved == 0
+            finally:
+                await session.rollback()
+    finally:
+        await database.close()
+
+
+@pytest.mark.integration
 async def test_concurrent_holds_do_not_oversell_inventory() -> None:
     database = Database(
         os.getenv(
@@ -162,7 +324,7 @@ async def test_concurrent_holds_do_not_oversell_inventory() -> None:
             await session.flush()
 
             session.add(
-                InventoryLevelModel(
+                ProductOfferModel(
                     product_id=product.id,
                     provider_id=provider.id,
                     on_hand=5,
@@ -217,18 +379,14 @@ async def test_concurrent_holds_do_not_oversell_inventory() -> None:
         finally:
             async with database.session() as session, session.begin():
                 await session.execute(
-                    delete(InventoryLevelModel).where(
-                        InventoryLevelModel.product_id == product_id,
-                        InventoryLevelModel.provider_id == provider_id,
+                    delete(ProductOfferModel).where(
+                        ProductOfferModel.product_id == product_id,
+                        ProductOfferModel.provider_id == provider_id,
                     )
                 )
                 await session.execute(
-                    delete(InventoryProviderModel).where(
-                        InventoryProviderModel.id == provider_id
-                    )
+                    delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
                 )
-                await session.execute(
-                    delete(ProductModel).where(ProductModel.id == product_id)
-                )
+                await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
     finally:
         await database.close()

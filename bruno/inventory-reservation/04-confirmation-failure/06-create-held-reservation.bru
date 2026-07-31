@@ -1,0 +1,28 @@
+meta {
+  name: Create Reservation With Successful Remote Hold
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{baseUrl}}/v1/reservations
+  body: json
+  auth: none
+}
+headers {
+  Content-Type: application/json
+  X-User-ID: {{userId}}
+  Idempotency-Key: external-confirm-timeout-hold-001
+}
+body:json {
+  {"items": [{"product_id": "{{externalProductId}}", "provider_id": "{{confirmTimeoutProviderId}}", "quantity": 1}]}
+}
+script:post-response {
+  if (res.status === 201) bru.setVar("confirmFailureReservationId", res.body.id);
+}
+tests {
+  test("remote stock is held before confirmation", function() {
+    expect(res.status).to.equal(201);
+    expect(res.body.status).to.equal("pending");
+  });
+}

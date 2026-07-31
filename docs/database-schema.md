@@ -16,9 +16,9 @@ identity if index size becomes a measured bottleneck.
 | `products` | Minimal product identity required by reservations |
 | `inventory_providers` | Internal or external stock sources and capabilities |
 | `provider_credentials` | Authentication method and non-secret secret reference |
-| `inventory_levels` | Stock snapshot and locally reserved quantity per product/provider |
+| `product_offers` | Product/provider association and its stock reservation state |
 | `reservations` | User checkout reservation and lifecycle state |
-| `reservation_items` | Requested product quantities |
+| `reservation_items` | Requested product quantities and checkout-selected provider |
 | `inventory_allocations` | Provider selected for each reservation item |
 | `provider_operations` | Durable, idempotent hold/confirm/release work |
 | `orders` | Final result of a confirmed reservation |
@@ -26,7 +26,14 @@ identity if index size becomes a measured bottleneck.
 
 ## Core Consistency Rules
 
-- `(product_id, provider_id)` is unique in `inventory_levels`.
+- `(product_id, provider_id)` is unique in `product_offers` and acts as the
+  offer identity inside this bounded context.
+- `reservation_items.provider_id` persists the provider selected by the caller;
+  `inventory_allocations.provider_id` records the provider that actually held
+  stock after any group-scoped routing.
+- `product_offers.routing_group` is nullable. `NULL` means the selected offer
+  is not substitutable; equal non-null values opt offers into the same fallback
+  route for that product.
 - `0 <= reserved <= on_hand` is enforced by PostgreSQL.
 - `(user_id, idempotency_key)` is unique for reservations.
 - A reservation cannot contain the same product twice.
@@ -44,6 +51,8 @@ identity if index size becomes a measured bottleneck.
 - `(reservations.status, reservations.expires_at)` supports expiry workers.
 - `(provider_operations.status, provider_operations.next_attempt_at)` supports
   retry workers using `FOR UPDATE SKIP LOCKED`.
-- `(inventory_levels.product_id, allocation_priority)` supports provider
-  selection.
+- `(product_offers.product_id, allocation_priority)` supports deterministic
+  offer listing; checkout lookup uses the unique `(product_id, provider_id)`
+  constraint. `(product_id, routing_group, allocation_priority)` supports the
+  bounded fallback candidate query.
 - `(reservations.user_id, created_at)` supports reservation history.

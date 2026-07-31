@@ -1,0 +1,20 @@
+meta {
+  name: Verify Platform Stock Is Released
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{baseUrl}}/internal/v1/products/{{productId}}/providers/{{internalProviderId}}/inventory
+  body: none
+  auth: none
+}
+
+tests {
+  test("cancelled units return to availability", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.on_hand).to.equal(10);
+    expect(res.body.reserved).to.equal(0);
+    expect(res.body.available).to.equal(10);
+  });
+}

@@ -1,0 +1,24 @@
+meta {
+  name: Assign Success Offer
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/internal/v1/products/{{externalProductId}}/providers/{{successProviderId}}/inventory
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+body:json {
+  {
+    "on_hand": 99,
+    "allocation_priority": 10
+  }
+}
+tests {
+  test("success offer assigned", function() { expect(res.status).to.equal(200); });
+}

@@ -14,9 +14,14 @@ operational visibility take priority over feature count.
 
 - **Product**: a sellable item identified by a stable product ID and SKU.
 - **Inventory Provider**: the system or owner responsible for a source of stock.
-- **Inventory Level**: stock for one product at one provider.
+- **Product Offer**: one product offered by one provider, including the
+  provider-owned stock state needed by this bounded context. The pair
+  `(product_id, provider_id)` is its identity here.
+- **Routing Group**: an explicit set of operationally interchangeable offers.
+  Offers outside the selected offer's group are never candidates for fallback.
 - **Reservation**: a temporary claim created for a user's checkout.
-- **Reservation Item**: the requested quantity of one product.
+- **Reservation Item**: the requested quantity of one product from the
+  provider explicitly selected at checkout.
 - **Allocation**: the part of a reservation item assigned to a provider.
 - **Hold**: a provider-confirmed temporary claim on stock.
 - **Confirmation**: consumption of held stock after payment succeeds.
@@ -41,8 +46,8 @@ Tests observe behavior through these interfaces:
    `ReservationExpirationWorker` for expiration batching, polling, and graceful
    shutdown; `ReservationReconciliationWorker` for explicitly resolving
    unknown provider outcomes.
-2. `ProviderRouter` for capability-aware selection, failover, unknown outcomes,
-   and circuit-breaker behavior inside the service layer.
+2. `ProviderRouter` for provider capability checks, failure classification,
+   unknown outcomes, and circuit-breaker behavior inside the service layer.
 3. The controller HTTP interface for request validation, status codes,
    idempotency, and response contracts.
 4. Repository interfaces for PostgreSQL transaction, constraint, migration,
@@ -54,10 +59,20 @@ time, and randomness may be replaced at their explicit seams.
 ## Initial Assumptions
 
 - A reservation has a finite TTL.
-- A reservation is successful only when every requested item is allocated.
+- A reservation is successful only when every requested item is allocated to
+  its selected provider.
+- The catalog/product-detail context presents seller offers and sends the
+  selected `(product_id, provider_id)` pair to this service. Price, warranty,
+  shipping promise, and seller presentation remain catalog concerns.
 - A read-only external provider is not eligible for a hard reservation unless
   the platform owns an authoritative allocation quota for it.
-- Definite out-of-stock responses may fall through to another provider.
+- Checkout uses exactly the customer-selected provider unless its offer has a
+  `routing_group`. Grouped offers are an explicit business assertion that the
+  providers are interchangeable; definite out-of-stock or temporary failure
+  may route to the next group member by allocation priority.
+- An ungrouped marketplace seller is never silently replaced by another
+  seller. A timeout/unknown hold outcome never falls back, even inside a
+  routing group, because the first provider may already have created a hold.
 - A timeout is an unknown outcome, not proof of failure.
 - Provider operations use deterministic idempotency keys.
 - One reservation can create at most one order.

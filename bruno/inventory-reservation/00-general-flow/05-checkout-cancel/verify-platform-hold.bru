@@ -1,0 +1,20 @@
+meta {
+  name: Verify Platform Hold
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{baseUrl}}/internal/v1/products/{{productId}}/providers/{{internalProviderId}}/inventory
+  body: none
+  auth: none
+}
+
+tests {
+  test("platform units are temporarily held", function() {
+    expect(res.status).to.equal(200);
+    expect(res.body.on_hand).to.equal(10);
+    expect(res.body.reserved).to.equal(2);
+    expect(res.body.available).to.equal(8);
+  });
+}

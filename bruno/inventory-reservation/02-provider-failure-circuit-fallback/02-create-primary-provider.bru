@@ -1,0 +1,34 @@
+meta {
+  name: Create Failing Primary Provider
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/internal/v1/providers
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "name": "bruno-external-failing-primary",
+    "kind": "external",
+    "driver": "http",
+    "base_url": "http://external-provider-mock:9000/scenarios/server-error",
+    "request_timeout_ms": 300,
+    "capabilities": {"availability": true, "hold": true, "confirm": true, "release": true}
+  }
+}
+
+script:post-response {
+  if (res.status === 201) bru.setVar("failingProviderId", res.body.id);
+}
+
+tests {
+  test("failing primary is registered", function() { expect(res.status).to.equal(201); });
+}

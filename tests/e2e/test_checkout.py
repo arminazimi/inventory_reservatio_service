@@ -8,10 +8,10 @@ from sqlalchemy import delete
 from inventory_reservation.controller.main import build_app
 from inventory_reservation.repository.database import Database
 from inventory_reservation.repository.models import (
-    InventoryLevelModel,
     InventoryProviderModel,
     OrderModel,
     ProductModel,
+    ProductOfferModel,
     ReservationModel,
 )
 
@@ -24,32 +24,18 @@ async def cleanup_checkout_data(
     provider_id: UUID | None,
 ) -> None:
     async with database.session() as session, session.begin():
-        await session.execute(
-            delete(OrderModel).where(OrderModel.user_id == user_id)
-        )
-        await session.execute(
-            delete(ReservationModel).where(
-                ReservationModel.user_id == user_id
-            )
-        )
+        await session.execute(delete(OrderModel).where(OrderModel.user_id == user_id))
+        await session.execute(delete(ReservationModel).where(ReservationModel.user_id == user_id))
         if product_id is not None:
             await session.execute(
-                delete(InventoryLevelModel).where(
-                    InventoryLevelModel.product_id == product_id
-                )
+                delete(ProductOfferModel).where(ProductOfferModel.product_id == product_id)
             )
         if provider_id is not None:
             await session.execute(
-                delete(InventoryProviderModel).where(
-                    InventoryProviderModel.id == provider_id
-                )
+                delete(InventoryProviderModel).where(InventoryProviderModel.id == provider_id)
             )
         if product_id is not None:
-            await session.execute(
-                delete(ProductModel).where(
-                    ProductModel.id == product_id
-                )
-            )
+            await session.execute(delete(ProductModel).where(ProductModel.id == product_id))
 
 
 @pytest.mark.integration
@@ -101,15 +87,10 @@ async def test_user_can_complete_checkout_against_internal_inventory() -> None:
             assert provider_response.status_code == 201
             provider_id = UUID(provider_response.json()["id"])
 
-            enable_response = await client.post(
-                f"/internal/v1/providers/{provider_id}/enable"
-            )
+            enable_response = await client.post(f"/internal/v1/providers/{provider_id}/enable")
             assert enable_response.status_code == 200
 
-            inventory_url = (
-                f"/internal/v1/products/{product_id}"
-                f"/providers/{provider_id}/inventory"
-            )
+            inventory_url = f"/internal/v1/products/{product_id}/providers/{provider_id}/inventory"
             inventory_response = await client.put(
                 inventory_url,
                 json={
@@ -127,6 +108,7 @@ async def test_user_can_complete_checkout_against_internal_inventory() -> None:
                 "items": [
                     {
                         "product_id": str(product_id),
+                        "provider_id": str(provider_id),
                         "quantity": 2,
                     }
                 ]
@@ -148,9 +130,7 @@ async def test_user_can_complete_checkout_against_internal_inventory() -> None:
             assert retried_reservation_response.status_code == 201
             assert retried_reservation_response.json() == reservation
 
-            confirmation_url = (
-                f"/v1/reservations/{reservation['id']}/confirm"
-            )
+            confirmation_url = f"/v1/reservations/{reservation['id']}/confirm"
             confirmation_response = await client.post(
                 confirmation_url,
                 headers={"X-User-ID": str(user_id)},

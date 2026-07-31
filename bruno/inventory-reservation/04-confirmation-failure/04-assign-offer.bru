@@ -1,0 +1,24 @@
+meta {
+  name: Assign Confirmation Timeout Offer
+  type: http
+  seq: 4
+}
+
+put {
+  url: {{baseUrl}}/internal/v1/products/{{externalProductId}}/providers/{{confirmTimeoutProviderId}}/inventory
+  body: json
+  auth: none
+}
+
+headers {
+  Content-Type: application/json
+}
+body:json {
+  {
+    "on_hand": 99,
+    "allocation_priority": 10
+  }
+}
+tests {
+  test("confirmation-timeout offer assigned", function() { expect(res.status).to.equal(200); });
+}
